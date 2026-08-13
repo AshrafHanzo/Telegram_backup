@@ -72,6 +72,7 @@ export interface DropUploadResult {
 export interface BandwidthStats {
     up_bytes: number;
     down_bytes: number;
+    limit: number;
 }
 
 export interface DownloadItem {
@@ -100,6 +101,27 @@ export interface ShareInfo {
     expires_at: number | null;
     revoked: boolean;
     has_password: boolean;
+    link: string;
+    always_on: boolean;
+    usage_limit: number | null;
+    usage_count: number;
+}
+
+/** A permissioned, folder-scoped "Temp Link" — see cmd_create_folder_share. */
+export interface FolderShareInfo {
+    id: string;
+    folder_id: number | null;
+    folder_name: string;
+    can_upload: boolean;
+    can_download: boolean;
+    can_update: boolean;
+    can_delete: boolean;
+    has_password: boolean;
+    /** Login username required alongside the password, if set. Not secret. */
+    username: string | null;
+    expires_at: number | null;
+    revoked: boolean;
+    created_at: number;
     link: string;
 }
 

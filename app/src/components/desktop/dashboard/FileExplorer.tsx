@@ -1,5 +1,5 @@
 import { useState, useMemo, useCallback, useRef, useEffect } from 'react';
-import { Plus, ArrowUpDown, ArrowUp, ArrowDown, FolderUp } from 'lucide-react';
+import { Plus, ArrowUpDown, ArrowUp, ArrowDown, FolderUp, FolderOpen, UploadCloud } from 'lucide-react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { useTranslation } from 'react-i18next';
 import { useSettings } from '../../../context/SettingsContext';
@@ -217,7 +217,32 @@ export function FileExplorer({
     if (files.length === 0) {
         return (
             <div className="flex-1 overflow-auto p-5">
-                <EmptyState onUpload={onManualUpload} />
+                <EmptyState
+                    icon={
+                        <>
+                            <FolderOpen className="h-6 w-6" strokeWidth={1.6} />
+                            <span className="absolute -bottom-1.5 -end-1.5 flex h-5 w-5 items-center justify-center rounded-full border border-app-border bg-app-surface-raised text-app-accent">
+                                <Plus className="h-3 w-3" />
+                            </span>
+                        </>
+                    }
+                    title="This folder is empty"
+                    description="Drag and drop files here, or click the button below to upload from your computer."
+                    actionLabel={t('common.upload_file')}
+                    actionIcon={<UploadCloud className="h-3.5 w-3.5" />}
+                    actionClassName="toolbar-upload-action"
+                    onAction={onManualUpload}
+                    tone="accent"
+                    tip={
+                        <>
+                            Tip: Use{' '}
+                            <kbd className="rounded-control border border-app-border bg-app-surface-sunken/45 px-1.5 py-0.5 font-mono text-app-text-secondary">
+                                Ctrl/Cmd + F
+                            </kbd>{' '}
+                            to search
+                        </>
+                    }
+                />
             </div>
         );
     }

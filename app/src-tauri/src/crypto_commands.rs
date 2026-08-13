@@ -1,9 +1,28 @@
 use crate::crypto::error::CryptoError;
 use crate::crypto::state::{CryptoState, UnlockSessionId};
 use crate::db::DbConnection;
+use crate::share_common::VerifyRateLimiter;
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, State};
 use zeroize::Zeroize;
+
+/// Rate limits vault-unlock attempts. Distinct instance/bucket from App
+/// Lock's and TOTP's limiters (`AppLockOtpState`, `TotpSetupState`) — the
+/// vault passphrase is a separate secret from either of those, so a lockout
+/// on one must not affect (or share state with) the others.
+#[derive(Default)]
+pub struct VaultUnlockRateLimiter(VerifyRateLimiter);
+
+impl VaultUnlockRateLimiter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// Single shared bucket key: there's only ever one local vault, so unlike
+/// App Lock/TOTP (keyed per-email or per-purpose) there's nothing to key
+/// this per-caller by.
+const VAULT_UNLOCK_BUCKET: &str = "__vault_unlock__";
 
 const CRYPTO_CONTRACT_VERSION: u16 = 2;
 const CRYPTO_BACKEND_BUILD_ID: &str = concat!(env!("CARGO_PKG_VERSION"), "-tdenc2");
@@ -254,11 +273,20 @@ pub async fn cmd_create_vault(
 }
 
 /// Unlock the vault and get a session handle.
+///
+/// Rate-limited (see `VaultUnlockRateLimiter`) so repeated wrong-passphrase
+/// guesses against the on-disk vault are throttled — mirrors the same
+/// defense-in-depth pattern used by App Lock's and TOTP's verify commands.
 #[tauri::command]
 pub async fn cmd_unlock_vault(
     mut passphrase: String,
     crypto_state: State<'_, CryptoState>,
+    unlock_limiter: State<'_, VaultUnlockRateLimiter>,
 ) -> Result<UnlockSessionId, String> {
+    if !unlock_limiter.0.check_and_record(VAULT_UNLOCK_BUCKET) {
+        passphrase.zeroize();
+        return Err("Too many attempts. Please wait a few minutes and try again.".to_string());
+    }
     let result = crypto_state
         .unlock(passphrase.as_bytes())
         .map_err(|e| e.to_string());

@@ -1,0 +1,13 @@
+diff --git a/node_modules/react-native-tdlib/react-native.config.js b/node_modules/react-native-tdlib/react-native.config.js
+index c959257..ee90a0b 100644
+--- a/node_modules/react-native-tdlib/react-native.config.js
++++ b/node_modules/react-native-tdlib/react-native.config.js
+@@ -9,7 +9,7 @@ module.exports = {
+             // which breaks autolinking on RN >= 0.78.
+             ios: {},
+             android: {
+-                sourceDir: path.join(__dirname, 'android'),
++                sourceDir: 'android',
+                 packageImportPath: 'import com.reactnativetdlib.tdlibclient.TdLibPackage;',
+                 packageInstance: 'new TdLibPackage()',
+             },

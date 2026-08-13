@@ -5,11 +5,20 @@ use std::path::PathBuf;
 use chrono::Local;
 use tauri::Manager;
 
+/// 250 GB — the original hardcoded default, kept as the fallback for
+/// existing `bandwidth.json` files saved before `limit` became configurable,
+/// and as the starting value for brand new installs.
+fn default_limit() -> u64 {
+    250 * 1024 * 1024 * 1024
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct BandwidthStats {
     pub date: String,
     pub up_bytes: u64,
     pub down_bytes: u64,
+    #[serde(default = "default_limit")]
+    pub limit: u64,
 }
 
 impl Default for BandwidthStats {
@@ -18,6 +27,7 @@ impl Default for BandwidthStats {
             date: Local::now().format("%Y-%m-%d").to_string(),
             up_bytes: 0,
             down_bytes: 0,
+            limit: default_limit(),
         }
     }
 }
@@ -25,7 +35,6 @@ impl Default for BandwidthStats {
 pub struct BandwidthManager {
     pub file_path: PathBuf,
     pub stats: Mutex<BandwidthStats>,
-    pub limit: u64, // Daily limit in bytes
 }
 
 #[derive(Clone, Copy)]
@@ -101,7 +110,6 @@ impl BandwidthManager {
         Self {
             file_path,
             stats: Mutex::new(stats),
-            limit: 250 * 1024 * 1024 * 1024, // 250 GB
         }
     }
 
@@ -122,8 +130,8 @@ impl BandwidthManager {
         self.check_and_reset();
         let stats = self.stats.lock().unwrap();
         let total = stats.up_bytes + stats.down_bytes + bytes;
-        if total > self.limit {
-            return Err(format!("Daily bandwidth limit ({}) exceeded! Used: {}", self.format_bytes(self.limit), self.format_bytes(total)));
+        if total > stats.limit {
+            return Err(format!("Daily bandwidth limit ({}) exceeded! Used: {}", self.format_bytes(stats.limit), self.format_bytes(total)));
         }
         Ok(())
     }
@@ -134,8 +142,8 @@ impl BandwidthManager {
         self.check_and_reset();
         let mut stats = self.stats.lock().unwrap();
         let total = stats.up_bytes + stats.down_bytes + bytes;
-        if total > self.limit {
-            return Err(format!("Daily bandwidth limit ({}) exceeded! Used: {}", self.format_bytes(self.limit), self.format_bytes(total)));
+        if total > stats.limit {
+            return Err(format!("Daily bandwidth limit ({}) exceeded! Used: {}", self.format_bytes(stats.limit), self.format_bytes(total)));
         }
         stats.up_bytes += bytes;
         self.save_locked(&stats);
@@ -148,12 +156,21 @@ impl BandwidthManager {
         self.check_and_reset();
         let mut stats = self.stats.lock().unwrap();
         let total = stats.up_bytes + stats.down_bytes + bytes;
-        if total > self.limit {
-            return Err(format!("Daily bandwidth limit ({}) exceeded! Used: {}", self.format_bytes(self.limit), self.format_bytes(total)));
+        if total > stats.limit {
+            return Err(format!("Daily bandwidth limit ({}) exceeded! Used: {}", self.format_bytes(stats.limit), self.format_bytes(total)));
         }
         stats.down_bytes += bytes;
         self.save_locked(&stats);
         Ok(())
+    }
+
+    /// Updates the configurable daily cap and persists it immediately.
+    /// Pass `u64::MAX` for "unlimited" — the enforcement check is a plain
+    /// `>` comparison, so nothing can ever exceed it in practice.
+    pub fn set_limit(&self, new_limit_bytes: u64) {
+        let mut stats = self.stats.lock().unwrap();
+        stats.limit = new_limit_bytes;
+        self.save_locked(&stats);
     }
 
     /// Release reserved upload bandwidth after a failed transfer.

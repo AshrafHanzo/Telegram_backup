@@ -1,0 +1,20 @@
+export type RootStackParamList = {
+  Auth: undefined;
+  Home: undefined;
+  Folders: undefined;
+  Files: { chatId: number; title: string };
+  Settings: undefined;
+  GoogleAccount: undefined;
+  Backup: undefined;
+  ShareLinks: undefined;
+  Search: undefined;
+  Groups: undefined;
+  Preview: { fileId: number; name: string };
+  Archive: { fileId: number; name: string };
+  Credentials: undefined;
+  VideoPlayer: { fileId: number; name: string };
+  Network: undefined;
+  Vault: undefined;
+  RemoteBackup: undefined;
+  AuditLog: undefined;
+};

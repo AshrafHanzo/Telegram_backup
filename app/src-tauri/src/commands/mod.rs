@@ -28,6 +28,11 @@ pub struct TelegramState {
     /// Set of transfer IDs that have been cancelled. Checked cooperatively
     /// in upload/download chunk loops. Cleared on logout.
     pub cancelled_transfers: Arc<tokio::sync::RwLock<HashSet<String>>>,
+    /// Guards the one-shot remote-jobs check (see `remote_catalog.rs`) so it
+    /// runs exactly once per launch regardless of which of the several
+    /// `ensure_client_initialized` call sites first establishes the
+    /// connection — not a continuous poll, just a single flag flip.
+    pub remote_jobs_checked: Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub mod auth;
@@ -43,6 +48,15 @@ pub mod sharing;
 pub mod video_metadata;
 pub mod archive;
 pub mod folder_groups;
+pub mod backup;
+pub mod google_auth;
+pub mod smtp_settings;
+pub mod app_lock;
+pub mod relay;
+pub mod totp;
+pub mod notifications;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub mod autostart;
 
 pub use auth::*;
 pub use fs::*;

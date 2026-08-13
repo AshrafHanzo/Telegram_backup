@@ -34,9 +34,9 @@ import { PdfViewer } from './dashboard/PdfViewer';
 import { ArchiveViewerModal } from './dashboard/ArchiveViewerModal';
 import { SettingsModal } from './dashboard/SettingsModal';
 import { ShareDialog } from './dashboard/ShareDialog';
+import { TempLinkGeneratorModal } from './dashboard/TempLinkGeneratorModal';
 import { RenameFolderModal } from './dashboard/RenameFolderModal';
 import { RenameFileModal } from './dashboard/RenameFileModal';
-import { DesktopAdBanner } from './dashboard/DesktopAdBanner';
 import { RemoteUploadModal } from './dashboard/RemoteUploadModal';
 import { Files, Link, Copy, Check, X, Loader2, Share2 } from 'lucide-react';
 
@@ -97,6 +97,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     const [pdfFile, setPdfFile] = useState<TelegramFile | null>(null);
     const [archiveViewFile, setArchiveViewFile] = useState<TelegramFile | null>(null);
     const [shareFile, setShareFile] = useState<TelegramFile | null>(null);
+    const [tempLinkTarget, setTempLinkTarget] = useState<{ id: number | null; name: string } | null>(null);
     const [bulkShareLinks, setBulkShareLinks] = useState<Array<{ file: TelegramFile; link: string }> | null>(null);
     const [bulkShareLoading, setBulkShareLoading] = useState(false);
     const [bulkShareCopied, setBulkShareCopied] = useState<Set<string>>(new Set());
@@ -703,6 +704,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                         }
                     } catch { /* backend error already toasted in hook */ }
                 }}
+                onGenerateTempLink={(id, name) => setTempLinkTarget({ id, name })}
                 onCreate={handleCreateFolder}
                 isSyncing={isSyncing}
                 isConnected={isConnected}
@@ -817,14 +819,22 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             <SettingsModal
                 isOpen={showSettings}
                 onClose={() => setShowSettings(false)}
+                folders={folders}
             />
-
-            <DesktopAdBanner />
 
             {shareFile && (
                 <ShareDialog
                     file={shareFile}
                     onClose={() => setShareFile(null)}
+                />
+            )}
+
+            {tempLinkTarget && (
+                <TempLinkGeneratorModal
+                    folders={folders}
+                    initialFolderId={tempLinkTarget.id}
+                    initialFolderName={tempLinkTarget.name}
+                    onClose={() => setTempLinkTarget(null)}
                 />
             )}
 

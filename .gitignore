@@ -28,6 +28,7 @@ Error.html
 .gradle/
 local.properties
 *.keystore
+*.jks
 *.idsig
 *.DMP
 
@@ -39,6 +40,12 @@ local.properties
 .freebuff/
 *_IMPLEMENTATION_PLAN.md
 *_EXECUTION_REPORT.md
+
+# Google OAuth client secrets downloaded from Cloud Console — never commit these
+client_secret*.json
+
+# Tauri updater signing key — never commit this
+tauri-signing-key.pem
 
 
 

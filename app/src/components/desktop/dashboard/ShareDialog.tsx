@@ -1,10 +1,10 @@
 import { useState } from 'react';
-import { Plus, Link, Copy, Check, Shield, Clock, AlertCircle, Share2 } from 'lucide-react';
+import { Plus, Link, Copy, Check, AlertCircle, Share2 } from 'lucide-react';
 import { TelegramFile, ShareInfo } from '../../../types';
 import { invoke } from '@tauri-apps/api/core';
-import { motion, AnimatePresence } from 'framer-motion';
 import { nativeShareOrCopy } from '../../../utils';
 import { useTranslation } from 'react-i18next';
+import { SharePasswordAndExpiryFields, resolveExpiryHours, ExpiryType } from './SharePasswordAndExpiryFields';
 
 interface ShareDialogProps {
     file: TelegramFile;
@@ -15,7 +15,7 @@ export function ShareDialog({ file, onClose }: ShareDialogProps) {
     const { t } = useTranslation();
     const [password, setPassword] = useState('');
     const [requirePassword, setRequirePassword] = useState(false);
-    const [expiryType, setExpiryType] = useState<'never' | '1h' | '1d' | '7d' | 'custom'>('1d');
+    const [expiryType, setExpiryType] = useState<ExpiryType>('1d');
     const [customHours, setCustomHours] = useState('24');
     
     const [loading, setLoading] = useState(false);
@@ -23,32 +23,30 @@ export function ShareDialog({ file, onClose }: ShareDialogProps) {
     const [shareInfo, setShareInfo] = useState<ShareInfo | null>(null);
     const [copied, setCopied] = useState(false);
     const [customDomain, setCustomDomain] = useState('');
+    const [alwaysOn, setAlwaysOn] = useState(false);
+    const [usageLimit, setUsageLimit] = useState('');
 
     const handleGenerate = async () => {
         setLoading(true);
         setError(null);
         try {
-            let expiryHours: number | null = null;
-            if (expiryType === '1h') expiryHours = 1;
-            else if (expiryType === '1d') expiryHours = 24;
-            else if (expiryType === '7d') expiryHours = 168;
-            else if (expiryType === 'custom') {
-                const parsed = parseInt(customHours, 10);
-                if (isNaN(parsed) || parsed <= 0) {
-                    throw new Error('Please enter a valid number of hours');
-                }
-                expiryHours = parsed;
-            }
-
+            const expiryHours = resolveExpiryHours(expiryType, customHours);
             const pwdParam = requirePassword && password.trim() ? password : null;
+            const usageLimitParam = usageLimit.trim() ? parseInt(usageLimit, 10) : null;
 
+            // Always-on links need the file's real channel (the bot has to be
+            // added there) — the local/tunnel path stays folder_id: null as
+            // before, unchanged from existing behavior.
+            const useAlwaysOn = alwaysOn && !!file.folder_id;
             const res = await invoke<ShareInfo>('cmd_create_share', {
-                folderId: null, // Always file-level for now
+                folderId: useAlwaysOn ? file.folder_id : null,
                 messageId: file.id, // In Telegram Drive, file.id is the message id
                 fileName: file.name,
                 fileSize: file.size,
                 password: pwdParam,
                 expiryHours,
+                alwaysOn: useAlwaysOn,
+                usageLimit: usageLimitParam,
             });
 
             setShareInfo(res);
@@ -114,106 +112,47 @@ export function ShareDialog({ file, onClose }: ShareDialogProps) {
 
                     {!shareInfo ? (
                         <>
-                            {/* Security Option */}
-                            <div className="space-y-2">
-                                <div className="flex items-center justify-between py-1">
-                                    <span className="text-sm font-medium text-telegram-text flex items-center gap-2 select-none">
-                                        <Shield className="w-4 h-4 text-emerald-400" />
-                                        {t('share.password_protection')}
-                                    </span>
+                            <SharePasswordAndExpiryFields
+                                password={password}
+                                setPassword={setPassword}
+                                requirePassword={requirePassword}
+                                setRequirePassword={setRequirePassword}
+                                expiryType={expiryType}
+                                setExpiryType={setExpiryType}
+                                customHours={customHours}
+                                setCustomHours={setCustomHours}
+                            />
+
+                            <div className="quiet-surface p-3 space-y-2">
+                                <div className="flex items-center justify-between">
+                                    <div>
+                                        <p className="text-sm text-telegram-text font-medium">{t('share.always_on')}</p>
+                                        <p className="text-xs text-telegram-subtext">{t('share.always_on_desc')}</p>
+                                    </div>
                                     <button
                                         type="button"
-                                        onClick={() => setRequirePassword(!requirePassword)}
-                                        className={`relative w-10 h-5.5 rounded-full transition-colors duration-200 shrink-0 ${
-                                            requirePassword ? 'bg-telegram-primary' : 'bg-telegram-border'
-                                        }`}
+                                        onClick={() => setAlwaysOn(!alwaysOn)}
+                                        disabled={!file.folder_id}
+                                        className={`relative w-11 h-6 rounded-full transition-colors duration-200 shrink-0 ${alwaysOn ? 'bg-emerald-500' : 'bg-telegram-border'} disabled:opacity-40`}
                                     >
-                                        <span
-                                            className={`absolute top-0.5 left-0.5 w-4.5 h-4.5 rounded-full bg-white shadow transition-transform duration-200 ${
-                                                requirePassword ? 'translate-x-4.5' : 'translate-x-0'
-                                            }`}
-                                        />
+                                        <span className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform duration-200 ${alwaysOn ? 'translate-x-5' : 'translate-x-0'}`} />
                                     </button>
                                 </div>
-                                
-                                <AnimatePresence>
-                                    {requirePassword && (
-                                        <motion.div
-                                            initial={{ height: 0, opacity: 0, marginTop: 0 }}
-                                            animate={{ height: 'auto', opacity: 1, marginTop: 8 }}
-                                            exit={{ height: 0, opacity: 0, marginTop: 0 }}
-                                            transition={{ duration: 0.2, ease: 'easeInOut' }}
-                                            className="overflow-hidden"
-                                        >
-                                            <input
-                                                type="password"
-                                                placeholder={t('share.enter_password')}
-                                                value={password}
-                                                onChange={(e) => setPassword(e.target.value)}
-                                                className="w-full bg-telegram-surface/50 border border-telegram-border rounded-lg px-3 py-2 text-sm text-telegram-text focus:outline-none focus:border-telegram-primary placeholder:text-telegram-subtext/60"
-                                                autoFocus
-                                            />
-                                        </motion.div>
-                                    )}
-                                </AnimatePresence>
-                            </div>
-
-                            {/* Expiry Option */}
-                            <div className="space-y-2">
-                                <span className="text-sm font-medium text-telegram-text flex items-center gap-2">
-                                    <Clock className="w-4 h-4 text-amber-400" />
-                                    {t('share.expiration')}
-                                </span>
-                                <div className="grid grid-cols-3 gap-2">
-                                    {(['1h', '1d', '7d'] as const).map((type) => (
-                                        <button
-                                            key={type}
-                                            type="button"
-                                            onClick={() => setExpiryType(type)}
-                                            className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
-                                                expiryType === type 
-                                                    ? 'bg-telegram-primary border-telegram-primary text-white' 
-                                                    : 'bg-telegram-surface border-telegram-border text-telegram-text hover:bg-telegram-hover'
-                                            }`}
-                                        >
-                                            {type === '1h' ? t('share.one_hour') : type === '1d' ? t('share.one_day') : t('share.seven_days')}
-                                        </button>
-                                    ))}
-                                    <button
-                                        type="button"
-                                        onClick={() => setExpiryType('never')}
-                                        className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
-                                            expiryType === 'never' 
-                                                ? 'bg-telegram-primary border-telegram-primary text-white' 
-                                                : 'bg-telegram-surface border-telegram-border text-telegram-text hover:bg-telegram-hover'
-                                        }`}
-                                    >
-                                        {t('share.never')}
-                                    </button>
-                                    <button
-                                        type="button"
-                                        onClick={() => setExpiryType('custom')}
-                                        className={`col-span-2 px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
-                                            expiryType === 'custom' 
-                                                ? 'bg-telegram-primary border-telegram-primary text-white' 
-                                                : 'bg-telegram-surface border-telegram-border text-telegram-text hover:bg-telegram-hover'
-                                        }`}
-                                    >
-                                        {t('share.custom_hours')}
-                                    </button>
-                                </div>
-
-                                {expiryType === 'custom' && (
-                                    <div className="flex gap-2 items-center mt-2 animate-in slide-in-from-top-1 duration-100">
+                                {!file.folder_id && (
+                                    <p className="text-xs text-amber-400">{t('share.always_on_needs_folder')}</p>
+                                )}
+                                {alwaysOn && file.folder_id && (
+                                    <>
+                                        <p className="text-xs text-telegram-subtext">{t('share.always_on_setup_note')}</p>
                                         <input
                                             type="number"
                                             min="1"
-                                            value={customHours}
-                                            onChange={(e) => setCustomHours(e.target.value)}
-                                            className="w-24 bg-telegram-surface/50 border border-telegram-border rounded-lg px-3 py-2 text-sm text-telegram-text focus:outline-none focus:border-telegram-primary"
+                                            placeholder={t('share.usage_limit_placeholder')}
+                                            value={usageLimit}
+                                            onChange={e => setUsageLimit(e.target.value)}
+                                            className="w-full bg-telegram-bg border border-telegram-border rounded-md px-3 py-1.5 text-sm text-telegram-text focus:outline-none focus:border-telegram-primary/50"
                                         />
-                                        <span className="text-xs text-telegram-subtext">{t('share.hours_from_now')}</span>
-                                    </div>
+                                    </>
                                 )}
                             </div>
 
@@ -238,8 +177,13 @@ export function ShareDialog({ file, onClose }: ShareDialogProps) {
                         <div className="space-y-4 animate-in fade-in duration-200">
                             <div className="bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-xs rounded-lg p-3 flex gap-2 items-center">
                                 <Check className="w-4 h-4 shrink-0" />
-                                <span>{t('share.link_created')}</span>
+                                <span>{shareInfo.always_on ? t('share.always_on_link_created') : t('share.link_created')}</span>
                             </div>
+                            {shareInfo.always_on && shareInfo.usage_limit && (
+                                <p className="text-xs text-telegram-subtext">
+                                    {t('share.usage_count', { used: shareInfo.usage_count, limit: shareInfo.usage_limit })}
+                                </p>
+                            )}
 
                             {/* Shareable Link Display */}
                             <div className="space-y-1.5">

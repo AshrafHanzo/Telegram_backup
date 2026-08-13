@@ -629,25 +629,31 @@ pub fn copy_to_android_cache(_raw_path: &str) -> Result<String, String> {
     Err("Not supported on this platform".to_string())
 }
 
-pub async fn create_folder_inner(
-    name: &str,
+/// Creates a bare Telegram channel with the given title/about text and primes
+/// the peer cache with it. Shared by `create_folder_inner` (normal Drive
+/// folders) and the Backup feature (which needs its own title/about tag so
+/// its channels stay invisible to `cmd_scan_folders`'s folder-detection
+/// heuristics — see `commands::backup`).
+pub async fn create_channel_raw(
+    title: String,
+    about: String,
     client: &grammers_client::Client,
     peer_cache: &Arc<tokio::sync::RwLock<HashMap<i64, Peer>>>,
-) -> Result<FolderMetadata, String> {
-    log::info!("Creating Telegram Channel: {}", name);
-    
+) -> Result<i64, String> {
+    log::info!("Creating Telegram Channel: {}", title);
+
     let result = client.invoke(&tl::functions::channels::CreateChannel {
         broadcast: true,
         megagroup: false,
-        title: format!("{} [TD]", name),
-        about: "Telegram Drive Storage Folder\n[telegram-drive-folder]".to_string(),
+        title,
+        about,
         geo_point: None,
         address: None,
         for_import: false,
         forum: false,
         ttl_period: None,
     }).await.map_err(map_error)?;
-    
+
     let (chat_id, access_hash) = match &result {
         tl::enums::Updates::Updates(u) => {
              let chat = u.chats.first().ok_or("No chat in updates")?;
@@ -660,13 +666,27 @@ pub async fn create_folder_inner(
                  _ => return Err("Created chat is not a channel".to_string()),
              }
         },
-        _ => return Err("Unexpected response (not Updates::Updates)".to_string()), 
+        _ => return Err("Unexpected response (not Updates::Updates)".to_string()),
     };
 
     let _ = client.invoke(&tl::functions::messages::SetHistoryTtl {
         peer: tl::enums::InputPeer::Channel(tl::types::InputPeerChannel { channel_id: chat_id, access_hash }),
-        period: 0, 
+        period: 0,
     }).await;
+    Ok(chat_id)
+}
+
+pub async fn create_folder_inner(
+    name: &str,
+    client: &grammers_client::Client,
+    peer_cache: &Arc<tokio::sync::RwLock<HashMap<i64, Peer>>>,
+) -> Result<FolderMetadata, String> {
+    let chat_id = create_channel_raw(
+        format!("{} [TD]", name),
+        "Telegram Drive Storage Folder\n[telegram-drive-folder]".to_string(),
+        client,
+        peer_cache,
+    ).await?;
     Ok(FolderMetadata {
         id: chat_id,
         name: name.to_string(),
@@ -807,7 +827,13 @@ pub async fn rename_folder_inner(
         channel: input_channel,
         title: format!("{} [TD]", new_name),
     }).await.map_err(|e| format!("Failed to rename channel: {}", e))?;
-    
+
+    // Invalidate the cached peer so the next `resolve_peer` call re-scans
+    // dialogs and picks up the new title, instead of serving the stale
+    // pre-rename `Channel` (which would leak into e.g. visibility-toggle
+    // username derivation or invite-export naming).
+    peer_cache.write().await.remove(&folder_id);
+
     Ok(true)
 }
 
@@ -1211,6 +1237,7 @@ pub async fn cmd_upload_file(
         net_config,
         crypto_state,
         db_pool,
+        None,
     ).await;
 
     if let Some(ref cache_path) = temp_cache_path {
@@ -1221,7 +1248,15 @@ pub async fn cmd_upload_file(
     result
 }
 
-async fn cmd_upload_file_inner(
+/// Core upload implementation shared by the interactive upload command and
+/// the Backup feature's background walker (`commands::backup::run_backup`).
+///
+/// `remote_name_override`, when set, is used as the Telegram document's name
+/// instead of the local file's basename — the Backup feature uses this to
+/// encode a file's path relative to its backup source root (e.g.
+/// `Docs/report.pdf`) so a flat Telegram channel can represent a nested local
+/// directory tree, and Restore can reconstruct it from that name alone.
+pub(crate) async fn cmd_upload_file_inner(
     path: String,
     folder_id: Option<i64>,
     transfer_id: Option<String>,
@@ -1234,6 +1269,7 @@ async fn cmd_upload_file_inner(
     net_config: State<'_, std::sync::Arc<NetworkConfig>>,
     crypto_state: State<'_, crate::crypto::state::CryptoState>,
     db_pool: State<'_, DbConnection>,
+    remote_name_override: Option<String>,
 ) -> Result<String, String> {
 
     let plaintext_size = tokio::fs::metadata(&path).await.map_err(|e| e.to_string())?.len();
@@ -1257,7 +1293,12 @@ async fn cmd_upload_file_inner(
 
     // --- Standard upload path (unchanged) ---
     let size = plaintext_size;
-    bw_state.try_reserve_up(size)?;
+    // RAII reservation prevents quota leaks on every error and cancellation
+    // path (including ones that might be added later) — same pattern as
+    // `cmd_upload_file_encrypted` below. `commit()` is only called on the
+    // final success path; every other return (including the cancellation
+    // checks and a retry-exhausted failure) releases automatically on drop.
+    let mut bandwidth_reservation = BandwidthReservation::upload(bw_state.inner().clone(), size)?;
 
     let tid = transfer_id.unwrap_or_default();
 
@@ -1265,13 +1306,9 @@ async fn cmd_upload_file_inner(
     #[cfg(debug_assertions)]
     if client_opt.is_none() {
         log::info!("[MOCK] Uploaded file {} to {:?}", path, folder_id);
-        bw_state.release_up(size);
         return Ok("Mock upload successful".to_string());
     }
-    let client = client_opt.ok_or_else(|| {
-        bw_state.release_up(size);
-        "Client not connected".to_string()
-    })?;
+    let client = client_opt.ok_or_else(|| "Client not connected".to_string())?;
 
     // Emit start progress
     if !tid.is_empty() {
@@ -1281,14 +1318,20 @@ async fn cmd_upload_file_inner(
     }
 
     // Create progress-tracking reader
-    let (mut reader, file_size, bytes_counter) = ProgressReader::new(&path).await.map_err(|e| {
-        bw_state.release_up(size);
-        e
-    })?;
-    let file_name = std::path::Path::new(&path)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "file".to_string());
+    let (mut reader, file_size, bytes_counter) = ProgressReader::new(&path).await?;
+    // The Backup feature (the only caller that ever sets remote_name_override)
+    // needs the new message's id back so it can record it in its ledger and,
+    // on overwrite, delete the file's previous message. Every other caller
+    // only ever inspects success/failure, never this string's contents, so
+    // swapping it for the numeric id on that one path is behavior-preserving
+    // for all existing callers.
+    let report_message_id = remote_name_override.is_some();
+    let file_name = remote_name_override.unwrap_or_else(|| {
+        std::path::Path::new(&path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "file".to_string())
+    });
 
     // Spawn a progress reporter task that emits events every 250ms
     let cancelled = state.cancelled_transfers.clone();
@@ -1345,17 +1388,13 @@ async fn cmd_upload_file_inner(
                 if !tid.is_empty() {
                     get_upload_cancellations().lock().unwrap().remove(&tid);
                 }
-                res.map_err(|e| {
-                    bw_state.release_up(size);
-                    format!("Task join error: {}", e)
-                })?
+                res.map_err(|e| format!("Task join error: {}", e))?
             }
             _ = cancel_rx => {
                 log::info!("Aborting upload task for transfer ID: {}", tid);
                 upload_task.abort();
                 state.cancelled_transfers.write().await.remove(&tid);
                 if let Some(t) = progress_task { t.abort(); }
-                bw_state.release_up(size);
                 return Err("Transfer cancelled".to_string());
             }
         }
@@ -1376,11 +1415,15 @@ async fn cmd_upload_file_inner(
 
     for attempt in 0..=max_retries {
         match client.send_message(&peer, message.clone()).await {
-            Ok(_) => {
+            Ok(sent) => {
+        bandwidth_reservation.commit();
         if !tid.is_empty() {
             let _ = app_handle.emit("upload-progress", ProgressPayload {
                 id: tid, percent: 100, uploaded_bytes: size, total_bytes: size, speed_bytes_per_sec: 0,
             });
+        }
+        if report_message_id {
+            return Ok(sent.id().to_string());
         }
         return Ok("File uploaded successfully".to_string());
             }
@@ -1674,32 +1717,79 @@ async fn cmd_upload_file_encrypted(
     for attempt in 0..=max_retries {
         match client.send_message(&peer, message.clone()).await {
             Ok(_sent) => {
+                // Bandwidth was genuinely consumed on the wire regardless of what the
+                // post-upload verification below finds, so commit the reservation now
+                // rather than after the check.
                 bandwidth_reservation.commit();
                 if !tid.is_empty() {
                     let _ = app_handle.emit("upload-progress", ProgressPayload {
                         id: tid, percent: 100, uploaded_bytes: plaintext_size, total_bytes: plaintext_size, speed_bytes_per_sec: 0,
                     });
                 }
-                let folder_key = folder_id.map(|id| id.to_string()).unwrap_or_else(|| "home".to_string());
-                let header_sha256 = Sha256::digest(&header_bytes_for_registry).to_vec();
-                let record = EncryptedFileRecord {
-                    folder_key,
-                    message_id: _sent.id(),
-                    file_uuid: file_uuid.to_vec(),
-                    envelope_version: policy::FORMAT_VERSION,
-                    cipher_suite: policy::CIPHER_SUITE_XCHACHA20_POLY1305,
-                    ciphertext_size,
-                    plaintext_size: Some(plaintext_size),
-                    remote_name: remote_name.clone(),
-                    key_profile_id: Some(protection_mode.registry_name().to_string()),
-                    protection_mode: protection_mode.registry_name().to_string(),
-                    metadata_protected: protect_metadata,
-                    header_blob: Some(header_bytes_for_registry.clone()),
-                    header_sha256: Some(header_sha256),
-                    record_state: EncryptedFileState::Active,
-                    reconciliation_state: "ok".to_string(),
-                    created_at: chrono::Utc::now().timestamp(),
-                    last_verified_at: None,
+
+                // Post-upload size verification.
+                //
+                // The vendored grammers-client transport (`PartStream::next_part`)
+                // accepts a short read on the FINAL chunk of an upload without
+                // erroring — only a short read on a non-final chunk is rejected. If
+                // the source file shrinks mid-stream (truncation, flaky network
+                // drive, a file actively being written) during exactly its last
+                // chunk, `upload_stream` can return `Ok` having actually sent fewer
+                // bytes than `ciphertext_size` promised, and the message we just
+                // sent would carry that shorter ciphertext.
+                //
+                // Recompute the expected ciphertext length from the envelope header
+                // we generated and compare it against the size Telegram actually
+                // recorded for the message we just sent — reusing the exact same
+                // check `registry_record_from_header` already performs for the
+                // listing/reconciliation probes, so upload-time and listing-time
+                // verification can never disagree.
+                let actual_media_size = _sent.media().map(|media| media_size(&media)).unwrap_or(0);
+                let record = match registry_record_from_header(
+                    folder_id,
+                    _sent.id(),
+                    remote_name.clone(),
+                    actual_media_size,
+                    header_bytes_for_registry.clone(),
+                    "ok",
+                ) {
+                    Ok(record) => {
+                        // Defensive consistency check: the registry record's
+                        // protection mode is derived from the header's actual key
+                        // slots, which should always agree with the mode this
+                        // upload was requested under. A mismatch would indicate an
+                        // internal bug (e.g. a key slot silently dropped), not a
+                        // Telegram-side issue — surface it without failing the
+                        // otherwise-verified upload.
+                        if record.protection_mode != protection_mode.registry_name() {
+                            log::warn!(
+                                "Encrypted upload {} (message {}): header-derived protection mode ({}) does not match the requested upload mode ({}).",
+                                remote_name,
+                                _sent.id(),
+                                record.protection_mode,
+                                protection_mode.registry_name()
+                            );
+                        }
+                        record
+                    }
+                    Err(error) => {
+                        // Do NOT write anything to the encrypted-file registry here:
+                        // the message is left un-indexed (not `record_state = 'active'`),
+                        // and the existing listing-time probe already classifies an
+                        // un-indexed TDENC2 message that fails this same size check as
+                        // `encrypted_corrupt` on the next refresh — so no separate
+                        // "corrupt" bookkeeping is needed to make this visible later.
+                        log::error!(
+                            "Encrypted upload {} was sent as message {}, but post-upload size verification failed ({}) — reporting the upload as failed instead of trusting a possibly-truncated ciphertext.",
+                            remote_name,
+                            _sent.id(),
+                            error
+                        );
+                        return Err(format!(
+                            "Upload reached Telegram but failed post-upload size verification ({}). The file was NOT recorded as backed up.",
+                            error
+                        ));
+                    }
                 };
                 let registry_result = db_pool
                     .lock()
@@ -1904,11 +1994,11 @@ pub async fn cmd_delete_file(
 
 #[derive(Debug, serde::Deserialize)]
 pub struct DownloadFileRequest {
-    message_id: i32,
-    save_path: String,
-    folder_id: Option<i64>,
-    transfer_id: Option<String>,
-    prompt_token: Option<u64>,
+    pub(crate) message_id: i32,
+    pub(crate) save_path: String,
+    pub(crate) folder_id: Option<i64>,
+    pub(crate) transfer_id: Option<String>,
+    pub(crate) prompt_token: Option<u64>,
 }
 
 #[tauri::command]
@@ -2588,10 +2678,24 @@ pub async fn cmd_move_files(
         Ok(messages) => messages,
         Err(e) => return Err(format!("Forward failed: {}", e)),
     };
-    
-    match client.delete_messages(&source_peer, &message_ids).await {
-        Ok(_) => {},
-        Err(e) => return Err(format!("Delete original failed: {}", e)),
+
+    // `forward_messages` returns one `Option<Message>` per input id — `None`
+    // means Telegram never confirmed that particular item was forwarded
+    // (e.g. concurrently deleted, or forwarding restricted for that item).
+    // Deleting an original whose forward was never confirmed would destroy
+    // the only copy, so only confirmed ids are deleted.
+    let confirmed_ids: Vec<i32> = message_ids
+        .iter()
+        .zip(forwarded.iter())
+        .filter(|(_, forwarded_message)| forwarded_message.is_some())
+        .map(|(id, _)| *id)
+        .collect();
+
+    if !confirmed_ids.is_empty() {
+        match client.delete_messages(&source_peer, &confirmed_ids).await {
+            Ok(_) => {},
+            Err(e) => return Err(format!("Delete original failed: {}", e)),
+        }
     }
 
     if forwarded.len() == message_ids.len() {
@@ -3815,6 +3919,7 @@ pub async fn cmd_upload_from_url(
             net_config,
             crypto_state,
             db_pool,
+            None,
         )
         .await;
         let _ = tokio::fs::remove_file(&staged_path).await;

@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { createPortal } from 'react-dom';
-import { MoreVertical, Globe, Pencil, Trash2, EyeOff, Eye, Link } from 'lucide-react';
+import { MoreVertical, Globe, Pencil, Trash2, EyeOff, Eye, Link, Link2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useSortable } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
@@ -18,6 +18,7 @@ interface SidebarItemProps {
     onRename?: () => void;
     onToggleVisibility?: () => void;
     onExportInvite?: () => void;
+    onGenerateTempLink?: () => void;
     collapsed?: boolean;
     groups?: FolderGroup[];
     onAssignFolderToGroup?: (folderId: number, groupId: number | null) => void;
@@ -27,7 +28,7 @@ interface SidebarItemProps {
  * Sortable sidebar folder and drop target for pointer/keyboard file moves.
  */
 export function SidebarItem({
-    icon: Icon, label, active = false, onClick, onDelete, folderId, isPublic, onRename, onToggleVisibility, onExportInvite, collapsed = false,
+    icon: Icon, label, active = false, onClick, onDelete, folderId, isPublic, onRename, onToggleVisibility, onExportInvite, onGenerateTempLink, collapsed = false,
     groups = [], onAssignFolderToGroup
 }: SidebarItemProps) {
     const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
@@ -120,7 +121,7 @@ export function SidebarItem({
             onClick={onClick}
             title={collapsed ? label : undefined}
             onContextMenu={openContextMenu}
-            className={`quiet-control group flex h-8 w-full cursor-pointer select-none items-center text-ui ${collapsed ? 'justify-center px-0' : 'gap-2.5 px-2.5'} ${active
+            className={`quiet-control group flex h-8 w-full cursor-pointer select-none items-center text-ui animate-in fade-in slide-in-from-top-1 duration-200 ${collapsed ? 'justify-center px-0' : 'gap-2.5 px-2.5'} ${active
                 ? 'bg-app-selected font-medium text-app-text'
                 : isFileDragOver
                     ? 'bg-app-selected text-app-text ring-2 ring-app-accent'
@@ -201,6 +202,16 @@ export function SidebarItem({
                         >
                             <Link className="w-4 h-4 text-telegram-primary" />
                             {t('files.copy_link')}
+                        </button>
+                    )}
+
+                    {onGenerateTempLink && (
+                        <button
+                            onClick={() => { setContextMenu(null); onGenerateTempLink(); }}
+                            className="quiet-menu-item min-h-10 gap-3 px-3 py-2"
+                        >
+                            <Link2 className="w-4 h-4 text-telegram-primary" />
+                            {t('temp_link.generate_for_folder')}
                         </button>
                     )}
 

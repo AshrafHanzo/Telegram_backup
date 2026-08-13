@@ -1,8 +1,16 @@
 import { useState, useEffect, useCallback } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
 import { motion, AnimatePresence } from 'framer-motion';
-import { X, RotateCcw, Download, Upload, Trash2, HardDrive, Globe, Key, Copy, Check, RefreshCw, FolderArchive, Shield, Zap, Activity, Gauge, Wifi, ChevronDown, Link, Sparkles, Info, Clipboard, Monitor, Loader2, Languages, Play, Palette, Plus, Tag, Moon, Sun } from 'lucide-react';
+import { X, RotateCcw, Download, Upload, Trash2, HardDrive, Globe, Key, Copy, Check, RefreshCw, FolderArchive, Shield, Zap, Activity, Gauge, Wifi, ChevronDown, Link, Sparkles, Info, Clipboard, Monitor, Loader2, Languages, Play, Palette, Plus, Tag, Moon, Sun, Cloud, FolderPlus, FolderOpen, Link2, Eye, EyeOff, KeyRound, LogOut, Lock, Mail, Ban } from 'lucide-react';
+import { GoogleGlyph } from '../../shared/GoogleGlyph';
+import { useGoogleOAuthPolling, GoogleAccountInfo } from '../../../hooks/useGoogleOAuthPolling';
+import { AppLockSetupFlow } from '../../shared/AppLockSetupFlow';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-shell';
+import { open as openFolderDialog } from '@tauri-apps/plugin-dialog';
+import { load as loadStore } from '@tauri-apps/plugin-store';
+import { listen } from '@tauri-apps/api/event';
+import { pickWithFallback } from '../../../utils';
 import { toast } from 'sonner';
 import { check, Update } from '@tauri-apps/plugin-updater';
 import { relaunch } from '@tauri-apps/plugin-process';
@@ -11,16 +19,21 @@ import { useConfirm } from '../../../context/ConfirmContext';
 import { useTranslation } from 'react-i18next';
 import { EncryptionSettingsSection } from '../../shared/EncryptionSettingsSection';
 import { LANGUAGES } from '../../../i18n/languages';
-import { ShareInfo, CacheEntry, DetailedCacheInfo } from '../../../types';
+import { ShareInfo, CacheEntry, DetailedCacheInfo, TelegramFolder, FolderShareInfo, BandwidthStats } from '../../../types';
+import { TempLinkGeneratorModal } from './TempLinkGeneratorModal';
+import { BackupDestinationModal } from './BackupDestinationModal';
+import { BackupExcludeModal } from './BackupExcludeModal';
 import { version as appVersion } from '../../../../package.json';
 import { useTheme } from '../../../context/ThemeContext';
 import { CustomTheme, ThemeColorPalette, generateThemeId } from '../../../theme/themeEngine';
 import { getDefaultPalette } from '../../../theme/presets';
 import { clearImageMemoryCaches } from '../../../services/imagePreviewCache';
+import { pullAndApplyGoogleDriveSync } from '../../../services/googleDriveSync';
 
 interface SettingsModalProps {
     isOpen: boolean;
     onClose: () => void;
+    folders?: TelegramFolder[];
 }
 
 interface ApiSettings {
@@ -45,12 +58,58 @@ interface WebDavTokenResponse {
     url: string;
 }
 
-type SettingsTab = 'general' | 'webdav' | 'themes' | 'proxy' | 'vpn' | 'encryption' | 'sharing' | 'about';
+interface BackupSourceFolder {
+    id: string;
+    local_path: string;
+    display_name: string;
+    channel_id: number | null;
+    enabled: boolean;
+    last_run_at: number | null;
+    last_run_status: string | null;
+    last_error: string | null;
+    excluded_paths: string[];
+}
 
-export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
+interface BackupSettings {
+    enabled: boolean;
+    schedule_hour: number;
+    schedule_minute: number;
+    sources: BackupSourceFolder[];
+    last_scheduled_run_at: number | null;
+    last_scheduled_run_status: string | null;
+}
+
+interface BackupStatus {
+    running: boolean;
+    current_source_id: string | null;
+    current_files_done: number;
+    current_files_total: number;
+    next_scheduled_run_at: number | null;
+    settings: BackupSettings;
+}
+
+interface BackupRunSummary {
+    sources_processed: number;
+    files_uploaded: number;
+    files_skipped: number;
+    files_failed: number;
+    errors: string[];
+}
+
+interface RestoreRunSummary {
+    restored: number;
+    skipped: number;
+    failed: number;
+    errors: string[];
+}
+
+type SettingsTab = 'general' | 'webdav' | 'backup' | 'google' | 'app-lock' | 'themes' | 'proxy' | 'vpn' | 'encryption' | 'sharing' | 'about';
+
+export function SettingsModal({ isOpen, onClose, folders = [] }: SettingsModalProps) {
     const { settings, updateSetting, resetSettings } = useSettings();
     const { confirm } = useConfirm();
     const { t } = useTranslation();
+    const queryClient = useQueryClient();
     const [clearing, setClearing] = useState(false);
 
     // Transcode cache state
@@ -75,6 +134,274 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
 
     // Diagnostics state
     const [diagLoading, setDiagLoading] = useState(false);
+
+    // Telegram API credentials (api_id / api_hash) — required for every
+    // cloud feature (streaming, backup, sharing) to reach Telegram at all.
+    // Persisted in the same `config.json` store AuthWizard writes to at
+    // first login, so this section can view/update them afterwards too.
+    const [telegramApiId, setTelegramApiId] = useState('');
+    const [telegramApiHash, setTelegramApiHash] = useState('');
+    const [showApiHash, setShowApiHash] = useState(false);
+    const [savingTelegramCreds, setSavingTelegramCreds] = useState(false);
+    const [telegramCredsDirty, setTelegramCredsDirty] = useState(false);
+
+    useEffect(() => {
+        if (!isOpen || activeTab !== 'general') return;
+        (async () => {
+            try {
+                const store = await loadStore('config.json');
+                const storedApiId = await store.get<string>('api_id');
+                const storedApiHash = await store.get<string>('api_hash');
+                setTelegramApiId(storedApiId ?? '');
+                setTelegramApiHash(storedApiHash ?? '');
+                setTelegramCredsDirty(false);
+            } catch {
+                // Store not readable yet — leave fields blank rather than error.
+            }
+        })();
+    }, [isOpen, activeTab]);
+
+    const handleSaveTelegramCredentials = useCallback(async () => {
+        const trimmedId = telegramApiId.trim();
+        const trimmedHash = telegramApiHash.trim();
+        if (!trimmedId || !trimmedHash) {
+            toast.error(t('settings.telegram_creds_required'));
+            return;
+        }
+        if (/\s/.test(trimmedId) || /\s/.test(trimmedHash) || !/^\d+$/.test(trimmedId)) {
+            toast.error(t('settings.telegram_creds_invalid'));
+            return;
+        }
+        setSavingTelegramCreds(true);
+        try {
+            const store = await loadStore('config.json');
+            await store.set('api_id', trimmedId);
+            await store.set('api_hash', trimmedHash);
+            await store.save();
+            await invoke('cmd_connect', { apiId: parseInt(trimmedId, 10) });
+            setTelegramCredsDirty(false);
+            toast.success(t('settings.telegram_creds_saved'));
+        } catch (error) {
+            toast.error(t('settings.telegram_creds_save_failed', { error }));
+        } finally {
+            setSavingTelegramCreds(false);
+        }
+    }, [telegramApiId, telegramApiHash, t]);
+
+    // --- Google Account (Drive-synced api_id/api_hash) ---
+    const [googleAccount, setGoogleAccount] = useState<GoogleAccountInfo | null>(null);
+    const [googleClientIdInput, setGoogleClientIdInput] = useState('');
+    const [googleClientSecretInput, setGoogleClientSecretInput] = useState('');
+    const [savingGoogleClient, setSavingGoogleClient] = useState(false);
+    const [editingGoogleClient, setEditingGoogleClient] = useState(false);
+
+    const fetchGoogleAccount = useCallback(async () => {
+        try {
+            const account = await invoke<GoogleAccountInfo>('cmd_get_google_account');
+            setGoogleAccount(account);
+            // Pre-fill with whatever's already saved instead of leaving a
+            // blank "one-time setup" form — single-user local app, so
+            // showing the current values back is a usability win, not a leak.
+            setGoogleClientIdInput(account.client_id ?? '');
+            setGoogleClientSecretInput(account.client_secret ?? '');
+
+            // Already signed into Google — refresh api_id/api_hash (and, as
+            // a side effect of the backend command, the App Lock cache)
+            // from Drive every time this tab is opened or a connect just
+            // succeeded, mirroring mobile's `GoogleAccountScreen.refresh()`.
+            // Best-effort: a failed pull just means locally-cached
+            // credentials/app-lock state stay as they were.
+            if (account.connected) {
+                pullAndApplyGoogleDriveSync().catch(() => {});
+            }
+        } catch {
+            // Google sign-in is optional; leave previous state as-is.
+        }
+    }, []);
+
+    useEffect(() => {
+        if (isOpen && activeTab === 'google') {
+            fetchGoogleAccount();
+        }
+    }, [isOpen, activeTab, fetchGoogleAccount]);
+
+    const handleGoogleConnected = useCallback(() => {
+        fetchGoogleAccount();
+    }, [fetchGoogleAccount]);
+
+    const googleOauth = useGoogleOAuthPolling(handleGoogleConnected);
+
+    // --- Authenticator (TOTP) setup — see commands/totp.rs for the actual
+    // encryption/sync this enables. Only meaningful once Google is
+    // connected, since that's what carries the encrypted session to Drive.
+    const [totpEnabled, setTotpEnabled] = useState(false);
+    const [totpSetupData, setTotpSetupData] = useState<{ base32Secret: string; qrSvg: string } | null>(null);
+    const [totpConfirmCode, setTotpConfirmCode] = useState('');
+    const [totpBusy, setTotpBusy] = useState(false);
+
+    const fetchTotpStatus = useCallback(async () => {
+        try {
+            const status = await invoke<{ enabled: boolean }>('cmd_totp_status');
+            setTotpEnabled(status.enabled);
+        } catch {
+            // Non-critical — leave previous state as-is.
+        }
+    }, []);
+
+    useEffect(() => {
+        if (isOpen && activeTab === 'google') {
+            fetchTotpStatus();
+        }
+    }, [isOpen, activeTab, fetchTotpStatus]);
+
+    const handleStartTotpSetup = useCallback(async () => {
+        setTotpBusy(true);
+        try {
+            const setup = await invoke<{ base32_secret: string; otpauth_uri: string; qr_svg: string }>('cmd_totp_setup_start');
+            setTotpSetupData({ base32Secret: setup.base32_secret, qrSvg: setup.qr_svg });
+        } catch (error) {
+            toast.error(t('settings.totp_setup_start_failed', { error }));
+        } finally {
+            setTotpBusy(false);
+        }
+    }, [t]);
+
+    const handleConfirmTotpSetup = useCallback(async () => {
+        setTotpBusy(true);
+        try {
+            await invoke('cmd_totp_setup_confirm', { code: totpConfirmCode.trim() });
+            setTotpSetupData(null);
+            setTotpConfirmCode('');
+            await fetchTotpStatus();
+            toast.success(t('settings.totp_setup_success'));
+        } catch (error) {
+            toast.error(t('settings.totp_setup_confirm_failed', { error }));
+        } finally {
+            setTotpBusy(false);
+        }
+    }, [totpConfirmCode, fetchTotpStatus, t]);
+
+    const handleDisableTotp = useCallback(async () => {
+        const ok = await confirm({
+            title: t('settings.totp_disable_title'),
+            message: t('settings.totp_disable_desc'),
+            confirmText: t('settings.totp_disable_confirm'),
+            variant: 'danger',
+        });
+        if (!ok) return;
+        setTotpBusy(true);
+        try {
+            await invoke('cmd_totp_disable');
+            await fetchTotpStatus();
+            toast.success(t('settings.totp_disabled'));
+        } catch (error) {
+            toast.error(t('settings.totp_disable_failed', { error }));
+        } finally {
+            setTotpBusy(false);
+        }
+    }, [fetchTotpStatus, t]);
+
+    useEffect(() => {
+        if (googleOauth.error) {
+            toast.error(t('settings.google_connect_failed', { error: googleOauth.error }));
+        }
+    }, [googleOauth.error, t]);
+
+    const handleSaveGoogleClient = useCallback(async () => {
+        if (!googleClientIdInput.trim() || !googleClientSecretInput.trim()) {
+            toast.error(t('settings.google_client_required'));
+            return;
+        }
+        setSavingGoogleClient(true);
+        try {
+            const account = await invoke<GoogleAccountInfo>('cmd_set_google_oauth_client', {
+                clientId: googleClientIdInput.trim(),
+                clientSecret: googleClientSecretInput.trim(),
+            });
+            setGoogleAccount(account);
+            setGoogleClientIdInput(account.client_id ?? '');
+            setGoogleClientSecretInput(account.client_secret ?? '');
+            setEditingGoogleClient(false);
+            toast.success(t('settings.google_client_saved'));
+        } catch (error) {
+            toast.error(t('settings.google_client_save_failed', { error }));
+        } finally {
+            setSavingGoogleClient(false);
+        }
+    }, [googleClientIdInput, googleClientSecretInput, t]);
+
+    const handleGoogleSignOut = useCallback(async () => {
+        try {
+            const account = await invoke<GoogleAccountInfo>('cmd_google_sign_out');
+            setGoogleAccount(account);
+            toast.success(t('settings.google_disconnected'));
+        } catch (error) {
+            toast.error(t('settings.google_disconnect_failed', { error }));
+        }
+    }, [t]);
+
+    // --- App Lock + SMTP sender ---
+    const [appLockStatus, setAppLockStatus] = useState<{ enabled: boolean; email: string | null } | null>(null);
+    const [showAppLockSetup, setShowAppLockSetup] = useState(false);
+    const [smtpSettings, setSmtpSettings] = useState<{ gmail_address: string | null; configured: boolean } | null>(null);
+    const [smtpGmailInput, setSmtpGmailInput] = useState('');
+    const [smtpAppPasswordInput, setSmtpAppPasswordInput] = useState('');
+    const [savingSmtp, setSavingSmtp] = useState(false);
+
+    const fetchAppLockStatus = useCallback(async () => {
+        try {
+            const status = await invoke<{ enabled: boolean; email: string | null }>('cmd_get_app_lock_status');
+            setAppLockStatus(status);
+        } catch {
+            // non-critical
+        }
+    }, []);
+
+    const fetchSmtpSettings = useCallback(async () => {
+        try {
+            const result = await invoke<{ gmail_address: string | null; configured: boolean }>('cmd_get_smtp_settings');
+            setSmtpSettings(result);
+        } catch {
+            // non-critical
+        }
+    }, []);
+
+    useEffect(() => {
+        if (isOpen && activeTab === 'app-lock') {
+            fetchAppLockStatus();
+            fetchSmtpSettings();
+        }
+    }, [isOpen, activeTab, fetchAppLockStatus, fetchSmtpSettings]);
+
+    const handleSaveSmtp = useCallback(async () => {
+        if (!smtpGmailInput.trim() || !smtpAppPasswordInput.trim()) {
+            toast.error(t('settings.smtp_required'));
+            return;
+        }
+        setSavingSmtp(true);
+        try {
+            const result = await invoke<{ gmail_address: string | null; configured: boolean }>('cmd_update_smtp_settings', {
+                gmailAddress: smtpGmailInput.trim(),
+                appPassword: smtpAppPasswordInput.trim(),
+            });
+            setSmtpSettings(result);
+            setSmtpAppPasswordInput('');
+            toast.success(t('settings.smtp_saved'));
+        } catch (error) {
+            toast.error(t('settings.smtp_save_failed', { error }));
+        } finally {
+            setSavingSmtp(false);
+        }
+    }, [smtpGmailInput, smtpAppPasswordInput, t]);
+
+    const handleToggleAppLock = useCallback(async (enabled: boolean) => {
+        try {
+            const status = await invoke<{ enabled: boolean; email: string | null }>('cmd_set_app_lock_enabled', { enabled });
+            setAppLockStatus(status);
+        } catch (error) {
+            toast.error(t('settings.app_lock_toggle_failed', { error }));
+        }
+    }, [t]);
 
     const handleCheckForUpdates = useCallback(async () => {
         setUpdateChecking(true);
@@ -137,8 +464,12 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
     const fetchShares = useCallback(async () => {
         setRefreshing(true);
         try {
-            const list = await invoke<ShareInfo[]>('cmd_list_shares');
-            setShares(list);
+            const [fileShares, folderList] = await Promise.all([
+                invoke<ShareInfo[]>('cmd_list_shares'),
+                invoke<FolderShareInfo[]>('cmd_list_folder_shares').catch(() => []),
+            ]);
+            setShares(fileShares);
+            setFolderShares(folderList);
         } catch (e) {
             toast.error(t('settings.load_shares_failed', { error: e }));
         } finally {
@@ -151,6 +482,99 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
             fetchShares();
         }
     }, [isOpen, activeTab, fetchShares]);
+
+    // Always-on relay (bot + Cloudflare Worker) configuration
+    const [relayStatus, setRelayStatus] = useState<{ bot_configured: boolean; bot_username: string | null; worker_configured: boolean } | null>(null);
+    const [botTokenInput, setBotTokenInput] = useState('');
+    const [savingBotToken, setSavingBotToken] = useState(false);
+    const [workerUrlInput, setWorkerUrlInput] = useState('');
+    const [adminSecretInput, setAdminSecretInput] = useState('');
+    const [savingWorkerConfig, setSavingWorkerConfig] = useState(false);
+
+    const fetchRelayStatus = useCallback(async () => {
+        try {
+            const status = await invoke<{ bot_configured: boolean; bot_username: string | null; worker_configured: boolean }>('cmd_get_relay_status');
+            setRelayStatus(status);
+        } catch {
+            // Non-critical — always-on links are opt-in.
+        }
+    }, []);
+
+    useEffect(() => {
+        if (isOpen && activeTab === 'sharing') {
+            fetchRelayStatus();
+        }
+    }, [isOpen, activeTab, fetchRelayStatus]);
+
+    const handleSaveBotToken = useCallback(async () => {
+        if (!botTokenInput.trim()) return;
+        setSavingBotToken(true);
+        try {
+            const status = await invoke<typeof relayStatus>('cmd_set_relay_bot_token', { botToken: botTokenInput.trim() });
+            setRelayStatus(status);
+            setBotTokenInput('');
+            toast.success(t('settings.relay_bot_saved'));
+        } catch (error) {
+            toast.error(t('settings.relay_bot_save_failed', { error }));
+        } finally {
+            setSavingBotToken(false);
+        }
+    }, [botTokenInput, t]);
+
+    const handleSaveWorkerConfig = useCallback(async () => {
+        if (!workerUrlInput.trim() || !adminSecretInput.trim()) return;
+        setSavingWorkerConfig(true);
+        try {
+            const status = await invoke<typeof relayStatus>('cmd_set_relay_worker_config', {
+                workerUrl: workerUrlInput.trim(),
+                adminSecret: adminSecretInput.trim(),
+            });
+            setRelayStatus(status);
+            toast.success(t('settings.relay_worker_saved'));
+        } catch (error) {
+            toast.error(t('settings.relay_worker_save_failed', { error }));
+        } finally {
+            setSavingWorkerConfig(false);
+        }
+    }, [workerUrlInput, adminSecretInput, t]);
+
+    // Temp Link Generator (folder-scoped, permissioned shares)
+    const [folderShares, setFolderShares] = useState<FolderShareInfo[]>([]);
+    const [showTempLinkGenerator, setShowTempLinkGenerator] = useState(false);
+    const [copiedFolderShareId, setCopiedFolderShareId] = useState<string | null>(null);
+
+    const handleCopyFolderShare = (id: string) => {
+        const share = folderShares.find(s => s.id === id);
+        if (!share) return;
+        let link = share.link;
+        if (globalDomain.trim()) {
+            try {
+                const url = new URL(share.link);
+                link = `${url.protocol}//${globalDomain.trim()}${url.pathname}`;
+            } catch { /* keep default link */ }
+        }
+        navigator.clipboard.writeText(link).then(() => {
+            setCopiedFolderShareId(id);
+            setTimeout(() => setCopiedFolderShareId(null), 2000);
+        });
+    };
+
+    const handleRevokeFolderShare = async (id: string) => {
+        const ok = await confirm({
+            title: t('settings.revoke_link_title'),
+            message: t('settings.revoke_link_desc'),
+            confirmText: t('settings.revoke'),
+            variant: 'danger',
+        });
+        if (!ok) return;
+        try {
+            await invoke('cmd_revoke_folder_share', { id });
+            toast.success(t('settings.link_revoked'));
+            fetchShares();
+        } catch (e) {
+            toast.error(t('settings.link_revoke_failed', { error: e }));
+        }
+    };
 
     const handleRevokeShare = async (id: string) => {
         const ok = await confirm({
@@ -273,6 +697,292 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
         return () => clearInterval(interval);
     }, [isOpen, activeTab, fetchWebDavSettings]);
 
+    // --- Backup feature state ---
+    const [backupStatus, setBackupStatus] = useState<BackupStatus | null>(null);
+    const [backupHour, setBackupHour] = useState('12');
+    const [backupMinute, setBackupMinute] = useState('00');
+    const [backupBusy, setBackupBusy] = useState(false);
+    const [addingBackupFolder, setAddingBackupFolder] = useState(false);
+    const [pendingBackupLocalPath, setPendingBackupLocalPath] = useState<string | null>(null);
+    const [restoreTargetId, setRestoreTargetId] = useState<string | null>(null);
+    const [restorePath, setRestorePath] = useState('');
+    const [restoring, setRestoring] = useState(false);
+
+    const fetchBackupStatus = useCallback(async () => {
+        try {
+            const result = await invoke<BackupStatus>('cmd_get_backup_status');
+            setBackupStatus(result);
+            setBackupHour(String(result.settings.schedule_hour).padStart(2, '0'));
+            setBackupMinute(String(result.settings.schedule_minute).padStart(2, '0'));
+        } catch {
+            // Backend not ready yet — leave previous state as-is.
+        }
+    }, []);
+
+    useEffect(() => {
+        if (isOpen && activeTab === 'backup') {
+            fetchBackupStatus();
+        }
+    }, [isOpen, activeTab, fetchBackupStatus]);
+
+    // Launch-at-startup + "keep running when closed" — without this,
+    // scheduled backups only ever fired while the app happened to be open.
+    const [autostartEnabled, setAutostartEnabled] = useState(false);
+    const [autostartBusy, setAutostartBusy] = useState(false);
+
+    const fetchAutostartStatus = useCallback(async () => {
+        try {
+            const enabled = await invoke<boolean>('cmd_get_autostart_enabled');
+            setAutostartEnabled(enabled);
+        } catch {
+            // Non-critical — leave previous state as-is.
+        }
+    }, []);
+
+    useEffect(() => {
+        if (isOpen && activeTab === 'backup') {
+            fetchAutostartStatus();
+        }
+    }, [isOpen, activeTab, fetchAutostartStatus]);
+
+    const handleToggleAutostart = useCallback(async () => {
+        setAutostartBusy(true);
+        try {
+            await invoke('cmd_set_autostart_enabled', { enabled: !autostartEnabled });
+            await fetchAutostartStatus();
+        } catch (error) {
+            toast.error(t('settings.autostart_toggle_failed', { error }));
+        } finally {
+            setAutostartBusy(false);
+        }
+    }, [autostartEnabled, fetchAutostartStatus, t]);
+
+    // Poll backup status while its tab is open — faster while a run is active
+    // so the progress line feels live even if the event listener below misses
+    // a tick (e.g. the tab was reopened mid-run).
+    useEffect(() => {
+        if (!isOpen || activeTab !== 'backup') return;
+        const interval = setInterval(fetchBackupStatus, backupStatus?.running ? 1000 : 5000);
+        return () => clearInterval(interval);
+    }, [isOpen, activeTab, fetchBackupStatus, backupStatus?.running]);
+
+    // Live progress while a backup/restore run is in flight.
+    useEffect(() => {
+        if (!isOpen || activeTab !== 'backup') return;
+        let unlistenFn: (() => void) | undefined;
+        listen('backup-progress', () => { void fetchBackupStatus(); }).then(fn => { unlistenFn = fn; });
+        return () => { unlistenFn?.(); };
+    }, [isOpen, activeTab, fetchBackupStatus]);
+
+    const handleAddBackupFolder = useCallback(async () => {
+        try {
+            const dirPath = await pickWithFallback(
+                () => openFolderDialog({ directory: true, multiple: false, title: t('settings.backup_pick_folder_title') }),
+                () => { /* no-op retry: user can just click Add Folder again */ },
+                { errorTitle: 'Folder picker failed' },
+            );
+            if (!dirPath || typeof dirPath !== 'string') return;
+            // Ask which Telegram folder to back up into before actually
+            // registering the source — see handleDestinationChosen.
+            setPendingBackupLocalPath(dirPath);
+        } catch (error) {
+            toast.error(t('settings.backup_folder_add_failed', { error }));
+        }
+    }, [t]);
+
+    // Destination picked → exclude-picker step next, before the source is
+    // actually registered (see handleConfirmBackupDestination).
+    const [pendingBackupChannelId, setPendingBackupChannelId] = useState<number | null>(null);
+    const [showBackupExcludeStep, setShowBackupExcludeStep] = useState(false);
+    const handleDestinationChosen = useCallback((channelId: number | null) => {
+        setPendingBackupChannelId(channelId);
+        setShowBackupExcludeStep(true);
+    }, []);
+
+    const handleConfirmBackupDestination = useCallback(async (excludedPaths: string[]) => {
+        const localPath = pendingBackupLocalPath;
+        const channelId = pendingBackupChannelId;
+        setPendingBackupLocalPath(null);
+        setPendingBackupChannelId(null);
+        setShowBackupExcludeStep(false);
+        if (!localPath) return;
+        setAddingBackupFolder(true);
+        try {
+            const updated = await invoke<BackupSettings>('cmd_add_backup_source', { localPath, channelId, excludedPaths });
+            setBackupStatus(previous => previous ? { ...previous, settings: updated } : previous);
+            toast.success(t('settings.backup_folder_added'));
+        } catch (error) {
+            toast.error(t('settings.backup_folder_add_failed', { error }));
+        } finally {
+            setAddingBackupFolder(false);
+        }
+    }, [pendingBackupLocalPath, pendingBackupChannelId, t]);
+
+    const handleCancelBackupAdd = useCallback(() => {
+        setPendingBackupLocalPath(null);
+        setPendingBackupChannelId(null);
+        setShowBackupExcludeStep(false);
+    }, []);
+
+    // Editing exclusions for a source that's already been added.
+    const [editingExclusionsFor, setEditingExclusionsFor] = useState<BackupSourceFolder | null>(null);
+    const handleSaveExclusions = useCallback(async (excludedPaths: string[]) => {
+        if (!editingExclusionsFor) return;
+        try {
+            const updated = await invoke<BackupSettings>('cmd_set_backup_exclusions', {
+                sourceId: editingExclusionsFor.id,
+                excludedPaths,
+            });
+            setBackupStatus(previous => previous ? { ...previous, settings: updated } : previous);
+            toast.success(t('settings.backup_exclude_saved'));
+        } catch (error) {
+            toast.error(t('settings.backup_exclude_save_failed', { error }));
+        } finally {
+            setEditingExclusionsFor(null);
+        }
+    }, [editingExclusionsFor, t]);
+
+    const handleRemoveBackupFolder = useCallback(async (sourceId: string, displayName: string) => {
+        const ok = await confirm({
+            title: t('settings.backup_remove_title'),
+            message: t('settings.backup_remove_desc', { name: displayName }),
+            confirmText: t('settings.backup_remove_confirm'),
+            variant: 'danger',
+        });
+        if (!ok) return;
+        try {
+            const updated = await invoke<BackupSettings>('cmd_remove_backup_source', { sourceId });
+            setBackupStatus(previous => previous ? { ...previous, settings: updated } : previous);
+        } catch (error) {
+            toast.error(t('settings.backup_remove_failed', { error }));
+        }
+    }, [t, confirm]);
+
+    const handleToggleBackupFolder = useCallback(async (sourceId: string, enabled: boolean) => {
+        try {
+            const updated = await invoke<BackupSettings>('cmd_set_backup_source_enabled', { sourceId, enabled });
+            setBackupStatus(previous => previous ? { ...previous, settings: updated } : previous);
+        } catch (error) {
+            toast.error(t('settings.backup_toggle_failed', { error }));
+        }
+    }, [t]);
+
+    const applyBackupSchedule = useCallback(async (enabled: boolean, hour: string, minute: string) => {
+        const parsedHour = Math.min(23, Math.max(0, parseInt(hour, 10) || 0));
+        const parsedMinute = Math.min(59, Math.max(0, parseInt(minute, 10) || 0));
+        try {
+            const updated = await invoke<BackupSettings>('cmd_update_backup_schedule', {
+                enabled,
+                scheduleHour: parsedHour,
+                scheduleMinute: parsedMinute,
+            });
+            setBackupStatus(previous => previous ? { ...previous, settings: updated } : previous);
+        } catch (error) {
+            toast.error(t('settings.backup_schedule_failed', { error }));
+        }
+    }, [t]);
+
+    const handleBackupScheduleToggle = useCallback(() => {
+        if (!backupStatus) return;
+        void applyBackupSchedule(!backupStatus.settings.enabled, backupHour, backupMinute);
+    }, [backupStatus, backupHour, backupMinute, applyBackupSchedule]);
+
+    const handleBackupTimeApply = useCallback(() => {
+        if (!backupStatus) return;
+        void applyBackupSchedule(backupStatus.settings.enabled, backupHour, backupMinute);
+    }, [backupStatus, backupHour, backupMinute, applyBackupSchedule]);
+
+    const handleBackupNow = useCallback(async () => {
+        setBackupBusy(true);
+        try {
+            const summary = await invoke<BackupRunSummary>('cmd_backup_now');
+            if (summary.files_failed > 0) {
+                toast.warning(t('settings.backup_now_partial', { uploaded: summary.files_uploaded, failed: summary.files_failed }));
+            } else {
+                toast.success(t('settings.backup_now_success', { uploaded: summary.files_uploaded, skipped: summary.files_skipped }));
+            }
+        } catch (error) {
+            toast.error(t('settings.backup_now_failed', { error }));
+        } finally {
+            setBackupBusy(false);
+            fetchBackupStatus();
+            // A backup run uploads/removes files directly on the backend,
+            // bypassing the normal upload queue entirely — so whichever
+            // folder(s) are currently open in the file browser never hear
+            // about it. Force every open folder view to refetch instead of
+            // showing stale contents until the user navigates away and back.
+            queryClient.invalidateQueries({ predicate: (query) => query.queryKey[0] === 'files' });
+        }
+    }, [t, fetchBackupStatus, queryClient]);
+
+    // "Backup All" (OneDrive-style): protects Desktop/Documents/Pictures.
+    // Only calculates + raises an approval notification here — actually
+    // adding the folders and uploading happens on approve, handled by
+    // cmd_respond_to_notification → backup::run_backup_all_approved.
+    const [backupAllBusy, setBackupAllBusy] = useState(false);
+    const handleBackupAll = useCallback(async () => {
+        setBackupAllBusy(true);
+        try {
+            await invoke('cmd_calculate_backup_all');
+            toast.success(t('settings.backup_all_calculated'));
+        } catch (error) {
+            toast.error(t('settings.backup_all_failed', { error }));
+        } finally {
+            setBackupAllBusy(false);
+        }
+    }, [t]);
+
+    const handleCancelBackup = useCallback(async () => {
+        try {
+            await invoke('cmd_cancel_backup');
+            toast.info(t('settings.backup_cancelling'));
+        } catch (error) {
+            toast.error(t('settings.backup_cancel_failed', { error }));
+        }
+    }, [t]);
+
+    const handlePickRestoreFolder = useCallback(async () => {
+        const dirPath = await pickWithFallback(
+            () => openFolderDialog({ directory: true, multiple: false, title: t('settings.backup_restore_pick_title') }),
+            () => { /* no-op retry */ },
+            { errorTitle: 'Folder picker failed' },
+        );
+        if (dirPath && typeof dirPath === 'string') {
+            setRestorePath(dirPath);
+        }
+    }, [t]);
+
+    const handleRestore = useCallback(async () => {
+        if (!restoreTargetId || !restorePath.trim()) return;
+        const source = backupStatus?.settings.sources.find(s => s.id === restoreTargetId);
+        const ok = await confirm({
+            title: t('settings.backup_restore_confirm_title'),
+            message: t('settings.backup_restore_confirm_desc', { name: source?.display_name ?? '', path: restorePath }),
+            confirmText: t('settings.backup_restore_confirm_action'),
+        });
+        if (!ok) return;
+
+        setRestoring(true);
+        try {
+            const summary = await invoke<RestoreRunSummary>('cmd_restore_backup', {
+                sourceId: restoreTargetId,
+                restorePath: restorePath.trim(),
+            });
+            if (summary.failed > 0) {
+                toast.warning(t('settings.backup_restore_partial', { restored: summary.restored, failed: summary.failed }));
+            } else {
+                toast.success(t('settings.backup_restore_success', { restored: summary.restored, skipped: summary.skipped }));
+            }
+            setRestoreTargetId(null);
+            setRestorePath('');
+        } catch (error) {
+            toast.error(t('settings.backup_restore_failed', { error }));
+        } finally {
+            setRestoring(false);
+            fetchBackupStatus();
+        }
+    }, [restoreTargetId, restorePath, backupStatus, t, confirm]);
+
     // Sync proxy settings to backend whenever they change
     useEffect(() => {
         const applyProxy = async () => {
@@ -378,6 +1088,50 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
         };
         detect();
     }, [isOpen, activeTab]);
+
+    // Daily storage/transfer cap — separate from the KB/s throttle above:
+    // this limits total GB moved per day, not instantaneous speed.
+    const [bandwidthStats, setBandwidthStats] = useState<BandwidthStats | null>(null);
+    const [capUnlimited, setCapUnlimited] = useState(false);
+    const [capGb, setCapGb] = useState('250');
+    const [savingCap, setSavingCap] = useState(false);
+
+    const fetchBandwidthStats = useCallback(async () => {
+        try {
+            const stats = await invoke<BandwidthStats>('cmd_get_bandwidth');
+            setBandwidthStats(stats);
+            const isUnlimited = stats.limit >= Number.MAX_SAFE_INTEGER;
+            setCapUnlimited(isUnlimited);
+            if (!isUnlimited) {
+                setCapGb((stats.limit / (1024 * 1024 * 1024)).toFixed(0));
+            }
+        } catch {
+            // Non-critical — the cap still enforces server-side either way.
+        }
+    }, []);
+
+    useEffect(() => {
+        if (!isOpen || activeTab !== 'vpn') return;
+        fetchBandwidthStats();
+    }, [isOpen, activeTab, fetchBandwidthStats]);
+
+    const handleSaveBandwidthCap = useCallback(async () => {
+        setSavingCap(true);
+        try {
+            const gb = capUnlimited ? null : Math.max(1, parseFloat(capGb) || 1);
+            const stats = await invoke<BandwidthStats>('cmd_set_bandwidth_limit', { gigabytes: gb });
+            setBandwidthStats(stats);
+            // The sidebar's "Used Today" widget polls this same query — push
+            // the fresh value into its cache immediately instead of waiting
+            // for the next 5s poll to pick it up.
+            queryClient.setQueryData(['bandwidth'], stats);
+            toast.success(t('settings.storage_cap_saved'));
+        } catch (error) {
+            toast.error(t('settings.storage_cap_save_failed', { error }));
+        } finally {
+            setSavingCap(false);
+        }
+    }, [capUnlimited, capGb, t, queryClient]);
 
     const handleApiToggle = async () => {
         setApiLoading(true);
@@ -584,6 +1338,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
     };
 
     return (
+        <>
         <AnimatePresence>
             {isOpen && (
                 <motion.div
@@ -619,7 +1374,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                         <div className="flex min-h-0 flex-1">
                         {/* Settings navigation */}
                         <aside className="w-48 shrink-0 border-e border-app-border-subtle bg-app-sidebar p-3">
-                            {([['general', Globe], ['themes', Palette], ['proxy', Shield], ['vpn', Zap], ['webdav', HardDrive], ['encryption', Shield], ['sharing', Link], ['about', Info]] as const).map(([key, Icon]) => (
+                            {([['general', Globe], ['themes', Palette], ['proxy', Shield], ['vpn', Zap], ['webdav', HardDrive], ['backup', Cloud], ['google', GoogleGlyph], ['app-lock', Lock], ['encryption', Shield], ['sharing', Link], ['about', Info]] as const).map(([key, Icon]) => (
                                 <button
                                     key={key}
                                     onClick={() => setActiveTab(key as SettingsTab)}
@@ -648,6 +1403,71 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                         transition={{ duration: 0.12, ease: [0.2, 0.8, 0.2, 1] }}
                                         className="space-y-6 w-full"
                                     >
+
+                            {/* Telegram API Credentials */}
+                            <section className="space-y-3">
+                                <h3 className="text-xs font-semibold text-telegram-subtext uppercase tracking-wider flex items-center gap-2">
+                                    <KeyRound className="w-3.5 h-3.5" />
+                                    {t('settings.telegram_creds_title')}
+                                </h3>
+
+                                <div className="space-y-2.5 p-3 rounded-lg bg-telegram-hover/50">
+                                    <p className="text-xs text-telegram-subtext leading-relaxed">
+                                        {t('settings.telegram_creds_desc')}
+                                    </p>
+
+                                    <div className="space-y-1">
+                                        <label className="text-xs font-medium text-telegram-text">{t('settings.telegram_api_id')}</label>
+                                        <input
+                                            type="text"
+                                            inputMode="numeric"
+                                            value={telegramApiId}
+                                            onChange={e => { setTelegramApiId(e.target.value); setTelegramCredsDirty(true); }}
+                                            placeholder="12345678"
+                                            className="w-full bg-telegram-bg border border-telegram-border rounded-md px-3 py-1.5 text-sm text-telegram-text font-mono focus:outline-none focus:border-telegram-primary/50 transition"
+                                        />
+                                    </div>
+
+                                    <div className="space-y-1">
+                                        <label className="text-xs font-medium text-telegram-text">{t('settings.telegram_api_hash')}</label>
+                                        <div className="flex items-center gap-2">
+                                            <input
+                                                type={showApiHash ? 'text' : 'password'}
+                                                value={telegramApiHash}
+                                                onChange={e => { setTelegramApiHash(e.target.value); setTelegramCredsDirty(true); }}
+                                                placeholder="0123456789abcdef0123456789abcdef"
+                                                autoComplete="off"
+                                                className="min-w-0 flex-1 bg-telegram-bg border border-telegram-border rounded-md px-3 py-1.5 text-sm text-telegram-text font-mono focus:outline-none focus:border-telegram-primary/50 transition"
+                                            />
+                                            <button
+                                                type="button"
+                                                onClick={() => setShowApiHash(v => !v)}
+                                                className="shrink-0 p-1.5 rounded-md text-telegram-subtext hover:text-telegram-text hover:bg-telegram-hover transition"
+                                                title={showApiHash ? t('settings.telegram_hide_hash') : t('settings.telegram_show_hash')}
+                                            >
+                                                {showApiHash ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                                            </button>
+                                        </div>
+                                    </div>
+
+                                    <div className="flex items-center justify-between pt-1">
+                                        <button
+                                            onClick={() => open('https://my.telegram.org/apps')}
+                                            className="text-xs text-telegram-primary hover:underline"
+                                        >
+                                            {t('settings.telegram_get_credentials')}
+                                        </button>
+                                        <button
+                                            onClick={handleSaveTelegramCredentials}
+                                            disabled={savingTelegramCreds || !telegramCredsDirty}
+                                            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-telegram-primary/10 text-telegram-primary hover:bg-telegram-primary/20 transition disabled:opacity-50"
+                                        >
+                                            {savingTelegramCreds ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />}
+                                            {t('settings.telegram_creds_save')}
+                                        </button>
+                                    </div>
+                                </div>
+                            </section>
 
                             {/* Transfers Section */}
                             <section className="space-y-3">
@@ -1425,6 +2245,52 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                     </button>
                                 </div>
 
+                                {/* Daily storage cap — total GB moved per day, separate from the
+                                    KB/s throttle below (which limits instantaneous speed, not volume) */}
+                                <div className="p-3 rounded-lg bg-telegram-hover/50 space-y-2.5">
+                                    <div>
+                                        <p className="text-sm text-telegram-text font-medium">{t('settings.storage_cap')}</p>
+                                        <p className="text-xs text-telegram-subtext">{t('settings.storage_cap_desc')}</p>
+                                    </div>
+                                    {bandwidthStats && (
+                                        <p className="text-xs text-telegram-subtext">
+                                            {t('settings.storage_cap_used', {
+                                                used: ((bandwidthStats.up_bytes + bandwidthStats.down_bytes) / (1024 * 1024 * 1024)).toFixed(2),
+                                            })}
+                                        </p>
+                                    )}
+                                    <div className="flex items-center justify-between">
+                                        <p className="text-xs text-telegram-subtext">{t('settings.storage_cap_unlimited')}</p>
+                                        <button
+                                            onClick={() => setCapUnlimited(!capUnlimited)}
+                                            className={`relative w-11 h-6 rounded-full transition-colors duration-200 ${capUnlimited ? 'bg-emerald-500' : 'bg-telegram-border'}`}
+                                        >
+                                            <span className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform duration-200 ${capUnlimited ? 'translate-x-5' : 'translate-x-0'}`} />
+                                        </button>
+                                    </div>
+                                    {!capUnlimited && (
+                                        <div className="flex items-center gap-2">
+                                            <input
+                                                type="number"
+                                                min="1"
+                                                step="1"
+                                                value={capGb}
+                                                onChange={e => setCapGb(e.target.value)}
+                                                className="w-24 rounded-md border border-telegram-border bg-telegram-bg px-2 py-1.5 text-sm text-telegram-text outline-none transition focus:border-telegram-primary/50"
+                                            />
+                                            <span className="text-xs text-telegram-subtext">{t('settings.storage_cap_gb_per_day')}</span>
+                                        </div>
+                                    )}
+                                    <button
+                                        onClick={handleSaveBandwidthCap}
+                                        disabled={savingCap}
+                                        className="flex items-center gap-1.5 rounded-lg bg-telegram-primary/10 px-3 py-1.5 text-xs font-medium text-telegram-primary transition hover:bg-telegram-primary/20 disabled:opacity-50"
+                                    >
+                                        {savingCap ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Check className="h-3.5 w-3.5" />}
+                                        {t('settings.storage_cap_save')}
+                                    </button>
+                                </div>
+
                                 {settings.vpnMode && (<>
                                     {/* Timeout Multiplier */}
                                     <div className="p-3 rounded-lg bg-telegram-hover/50 space-y-2">
@@ -1849,13 +2715,22 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                                 <Link className="w-3.5 h-3.5 text-telegram-primary" />
                                                 {t('settings.shared_links', { count: shares.length })}
                                             </h3>
-                                            <button 
-                                                onClick={fetchShares} 
-                                                className="text-telegram-subtext hover:text-telegram-text p-1 rounded hover:bg-telegram-hover transition"
-                                                title={t('settings.refresh_links')}
-                                            >
-                                                <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`} />
-                                            </button>
+                                            <div className="flex items-center gap-1">
+                                                <button
+                                                    onClick={() => setShowTempLinkGenerator(true)}
+                                                    className="flex items-center gap-1 rounded-md bg-telegram-primary/10 px-2 py-1 text-[11px] font-medium text-telegram-primary hover:bg-telegram-primary/20 transition"
+                                                >
+                                                    <Plus className="w-3 h-3" />
+                                                    {t('temp_link.new_button')}
+                                                </button>
+                                                <button
+                                                    onClick={fetchShares}
+                                                    className="text-telegram-subtext hover:text-telegram-text p-1 rounded hover:bg-telegram-hover transition"
+                                                    title={t('settings.refresh_links')}
+                                                >
+                                                    <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`} />
+                                                </button>
+                                            </div>
                                         </div>
 
                                         <div className="bg-telegram-hover/30 border border-telegram-border/50 rounded-lg p-3 space-y-2">
@@ -1869,6 +2744,73 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                             />
                                             <p className="text-[10px] text-telegram-subtext">
                                                 {t('settings.ip_override_desc')}
+                                            </p>
+                                        </div>
+
+                                        <div className="bg-telegram-hover/30 border border-telegram-border/50 rounded-lg p-3 space-y-3">
+                                            <div className="text-[11px] font-semibold text-telegram-text flex items-center gap-1">
+                                                🤖 {t('settings.relay_title')}
+                                            </div>
+                                            <p className="text-[10px] text-telegram-subtext">{t('settings.relay_desc')}</p>
+
+                                            <div className="space-y-1.5">
+                                                <div className="flex items-center gap-2 text-[11px]">
+                                                    {relayStatus?.bot_configured ? (
+                                                        <span className="text-emerald-400 flex items-center gap-1"><Check className="w-3 h-3" /> @{relayStatus.bot_username}</span>
+                                                    ) : (
+                                                        <span className="text-telegram-subtext">{t('settings.relay_bot_not_set')}</span>
+                                                    )}
+                                                </div>
+                                                <div className="flex gap-1.5">
+                                                    <input
+                                                        type="text"
+                                                        placeholder={t('settings.relay_bot_token_placeholder')}
+                                                        value={botTokenInput}
+                                                        onChange={e => setBotTokenInput(e.target.value)}
+                                                        className="flex-1 bg-telegram-surface border border-telegram-border rounded-md px-2.5 py-1.5 text-xs text-telegram-text font-mono focus:outline-none focus:border-telegram-primary/50"
+                                                    />
+                                                    <button
+                                                        onClick={handleSaveBotToken}
+                                                        disabled={savingBotToken || !botTokenInput.trim()}
+                                                        className="rounded-md bg-telegram-primary/10 px-2.5 py-1.5 text-[11px] font-medium text-telegram-primary hover:bg-telegram-primary/20 disabled:opacity-50 shrink-0"
+                                                    >
+                                                        {savingBotToken ? <Loader2 className="w-3 h-3 animate-spin" /> : t('settings.relay_save')}
+                                                    </button>
+                                                </div>
+                                            </div>
+
+                                            <div className="space-y-1.5">
+                                                <div className="text-[11px]">
+                                                    {relayStatus?.worker_configured ? (
+                                                        <span className="text-emerald-400 flex items-center gap-1"><Check className="w-3 h-3" /> {t('settings.relay_worker_configured')}</span>
+                                                    ) : (
+                                                        <span className="text-telegram-subtext">{t('settings.relay_worker_not_set')}</span>
+                                                    )}
+                                                </div>
+                                                <input
+                                                    type="text"
+                                                    placeholder={t('settings.relay_worker_url_placeholder')}
+                                                    value={workerUrlInput}
+                                                    onChange={e => setWorkerUrlInput(e.target.value)}
+                                                    className="w-full bg-telegram-surface border border-telegram-border rounded-md px-2.5 py-1.5 text-xs text-telegram-text font-mono focus:outline-none focus:border-telegram-primary/50"
+                                                />
+                                                <input
+                                                    type="text"
+                                                    placeholder={t('settings.relay_admin_secret_placeholder')}
+                                                    value={adminSecretInput}
+                                                    onChange={e => setAdminSecretInput(e.target.value)}
+                                                    className="w-full bg-telegram-surface border border-telegram-border rounded-md px-2.5 py-1.5 text-xs text-telegram-text font-mono focus:outline-none focus:border-telegram-primary/50"
+                                                />
+                                                <button
+                                                    onClick={handleSaveWorkerConfig}
+                                                    disabled={savingWorkerConfig || !workerUrlInput.trim() || !adminSecretInput.trim()}
+                                                    className="w-full rounded-md bg-telegram-primary/10 px-2.5 py-1.5 text-[11px] font-medium text-telegram-primary hover:bg-telegram-primary/20 disabled:opacity-50"
+                                                >
+                                                    {savingWorkerConfig ? <Loader2 className="w-3 h-3 animate-spin mx-auto" /> : t('settings.relay_save')}
+                                                </button>
+                                            </div>
+                                            <p className="text-[10px] text-telegram-subtext leading-relaxed">
+                                                {t('settings.relay_setup_help')}
                                             </p>
                                         </div>
 
@@ -1900,6 +2842,14 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                                                             </span>
                                                                         ) : (
                                                                             <span className="text-blue-400 bg-blue-500/10 px-1.5 py-0.5 rounded font-medium">{t('settings.public')}</span>
+                                                                        )}
+                                                                        {share.always_on && (
+                                                                            <>
+                                                                                <span className="w-1 h-1 rounded-full bg-telegram-border" />
+                                                                                <span className="text-purple-400 bg-purple-500/10 px-1.5 py-0.5 rounded font-medium">
+                                                                                    {t('settings.always_on_badge')}
+                                                                                </span>
+                                                                            </>
                                                                         )}
                                                                         <span className="w-1 h-1 rounded-full bg-telegram-border" />
                                                                         {share.expires_at ? (
@@ -1938,6 +2888,626 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                                         </div>
                                                     );
                                                 })}
+                                            </div>
+                                        )}
+
+                                        {/* Temp Links: permissioned, folder-scoped shares */}
+                                        <div className="flex items-center justify-between pt-2">
+                                            <h3 className="text-xs font-semibold text-telegram-subtext uppercase tracking-wider flex items-center gap-2">
+                                                <Link2 className="w-3.5 h-3.5 text-telegram-primary" />
+                                                {t('temp_link.active_links', { count: folderShares.length })}
+                                            </h3>
+                                        </div>
+                                        {folderShares.length === 0 ? (
+                                            <p className="py-3 text-center text-xs text-telegram-subtext">{t('temp_link.no_active_links')}</p>
+                                        ) : (
+                                            <div className="space-y-2 max-h-[260px] overflow-y-auto pr-1 custom-scrollbar">
+                                                {folderShares.map(share => {
+                                                    const isExpired = share.expires_at ? (share.expires_at < Math.floor(Date.now() / 1000)) : false;
+                                                    const chips: Array<[boolean, string]> = [
+                                                        [share.can_upload, t('temp_link.perm_upload')],
+                                                        [share.can_download, t('temp_link.perm_download')],
+                                                        [share.can_update, t('temp_link.perm_update')],
+                                                        [share.can_delete, t('temp_link.perm_delete')],
+                                                    ];
+                                                    return (
+                                                        <div key={share.id} className="p-3 rounded-lg bg-telegram-hover/40 border border-telegram-border/50 flex flex-col gap-2">
+                                                            <div className="flex justify-between items-start gap-4">
+                                                                <div className="min-w-0 flex-1">
+                                                                    <div className="text-xs font-semibold text-telegram-text truncate" title={share.folder_name}>
+                                                                        {share.folder_name}
+                                                                    </div>
+                                                                    <div className="flex gap-1 items-center mt-1.5 flex-wrap text-[10px]">
+                                                                        {chips.filter(([on]) => on).map(([, label]) => (
+                                                                            <span key={label} className="text-telegram-primary bg-telegram-primary/10 px-1.5 py-0.5 rounded font-medium">{label}</span>
+                                                                        ))}
+                                                                        {share.has_password && (
+                                                                            <span className="text-emerald-400 bg-emerald-500/10 px-1.5 py-0.5 rounded flex items-center gap-0.5 font-medium">
+                                                                                <Key className="w-2.5 h-2.5" /> {t('settings.protected')}
+                                                                            </span>
+                                                                        )}
+                                                                        {share.username && (
+                                                                            <span className="text-blue-400 bg-blue-500/10 px-1.5 py-0.5 rounded font-medium" title={share.username}>
+                                                                                {t('temp_link.username_badge')}
+                                                                            </span>
+                                                                        )}
+                                                                        {isExpired && (
+                                                                            <span className="text-red-400 bg-red-500/10 px-1.5 py-0.5 rounded font-medium">{t('settings.expired')}</span>
+                                                                        )}
+                                                                    </div>
+                                                                </div>
+                                                                <div className="flex gap-1">
+                                                                    <button
+                                                                        onClick={() => handleCopyFolderShare(share.id)}
+                                                                        className={`p-1.5 rounded bg-telegram-surface border border-telegram-border text-telegram-text hover:bg-telegram-hover transition ${
+                                                                            copiedFolderShareId === share.id ? 'text-emerald-400 border-emerald-500/30 bg-emerald-500/5' : ''
+                                                                        }`}
+                                                                        title={t('settings.copy_share_link')}
+                                                                    >
+                                                                        {copiedFolderShareId === share.id ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                                                                    </button>
+                                                                    <button
+                                                                        onClick={() => handleRevokeFolderShare(share.id)}
+                                                                        className="p-1.5 rounded bg-telegram-surface border border-telegram-border text-red-400 hover:bg-red-500/10 hover:border-red-500/30 transition"
+                                                                        title={t('settings.revoke_link')}
+                                                                    >
+                                                                        <Trash2 className="w-3.5 h-3.5" />
+                                                                    </button>
+                                                                </div>
+                                                            </div>
+                                                        </div>
+                                                    );
+                                                })}
+                                            </div>
+                                        )}
+                                    </motion.section>
+                                )}
+                                {activeTab === 'backup' && backupStatus && (
+                                    <motion.section
+                                        key="backup"
+                                        initial={{ opacity: 0 }}
+                                        animate={{ opacity: 1 }}
+                                        exit={{ opacity: 0 }}
+                                        transition={{ duration: 0.12, ease: [0.2, 0.8, 0.2, 1] }}
+                                        className="space-y-4 w-full"
+                                    >
+                                        <div className="flex items-start gap-3 rounded-lg border border-telegram-primary/20 bg-telegram-primary/5 p-3">
+                                            <Cloud className="mt-0.5 h-4 w-4 shrink-0 text-telegram-primary" />
+                                            <div>
+                                                <h3 className="text-sm font-semibold text-telegram-text">{t('settings.backup_title')}</h3>
+                                                <p className="mt-1 text-xs leading-relaxed text-telegram-subtext">{t('settings.backup_description')}</p>
+                                            </div>
+                                        </div>
+
+                                        {/* Schedule */}
+                                        <div className="flex items-center justify-between rounded-lg bg-telegram-hover/50 p-3">
+                                            <div>
+                                                <p className="text-sm font-medium text-telegram-text">{t('settings.backup_schedule_enable')}</p>
+                                                <p className="text-xs text-telegram-subtext">
+                                                    {backupStatus.settings.enabled && backupStatus.next_scheduled_run_at
+                                                        ? t('settings.backup_next_run', { time: new Date(backupStatus.next_scheduled_run_at * 1000).toLocaleString() })
+                                                        : t('settings.backup_schedule_disabled')}
+                                                </p>
+                                            </div>
+                                            <button
+                                                onClick={handleBackupScheduleToggle}
+                                                aria-label={t('settings.backup_schedule_enable')}
+                                                className={`relative h-6 w-11 shrink-0 rounded-full transition-colors duration-200 ${backupStatus.settings.enabled ? 'bg-telegram-primary' : 'bg-telegram-border'}`}
+                                            >
+                                                <span className={`absolute left-0.5 top-0.5 h-5 w-5 rounded-full bg-white shadow transition-transform duration-200 ${backupStatus.settings.enabled ? 'translate-x-5' : 'translate-x-0'}`} />
+                                            </button>
+                                        </div>
+
+                                        <div className="flex items-center justify-between rounded-lg bg-telegram-hover/50 p-3">
+                                            <div>
+                                                <p className="text-sm font-medium text-telegram-text">{t('settings.autostart_title')}</p>
+                                                <p className="text-xs text-telegram-subtext leading-relaxed">{t('settings.autostart_desc')}</p>
+                                            </div>
+                                            <button
+                                                onClick={handleToggleAutostart}
+                                                disabled={autostartBusy}
+                                                aria-label={t('settings.autostart_title')}
+                                                className={`relative h-6 w-11 shrink-0 rounded-full transition-colors duration-200 disabled:opacity-50 ${autostartEnabled ? 'bg-telegram-primary' : 'bg-telegram-border'}`}
+                                            >
+                                                <span className={`absolute left-0.5 top-0.5 h-5 w-5 rounded-full bg-white shadow transition-transform duration-200 ${autostartEnabled ? 'translate-x-5' : 'translate-x-0'}`} />
+                                            </button>
+                                        </div>
+
+                                        <div className="flex items-center justify-between rounded-lg bg-telegram-hover/50 p-3">
+                                            <p className="text-sm font-medium text-telegram-text">{t('settings.backup_schedule_time')}</p>
+                                            <div className="flex items-center gap-1 font-mono text-sm text-telegram-text">
+                                                <input
+                                                    type="number" inputMode="numeric" min="0" max="23"
+                                                    value={backupHour}
+                                                    onChange={e => setBackupHour(e.target.value)}
+                                                    onBlur={handleBackupTimeApply}
+                                                    onKeyDown={e => { if (e.key === 'Enter') e.currentTarget.blur(); }}
+                                                    className="w-12 rounded-md border border-telegram-border bg-telegram-bg px-1 py-1.5 text-center outline-none transition focus:border-telegram-primary/50"
+                                                />
+                                                <span>:</span>
+                                                <input
+                                                    type="number" inputMode="numeric" min="0" max="59"
+                                                    value={backupMinute}
+                                                    onChange={e => setBackupMinute(e.target.value)}
+                                                    onBlur={handleBackupTimeApply}
+                                                    onKeyDown={e => { if (e.key === 'Enter') e.currentTarget.blur(); }}
+                                                    className="w-12 rounded-md border border-telegram-border bg-telegram-bg px-1 py-1.5 text-center outline-none transition focus:border-telegram-primary/50"
+                                                />
+                                            </div>
+                                        </div>
+
+                                        {/* Protected folders */}
+                                        <div className="space-y-2 rounded-lg bg-telegram-hover/50 p-3">
+                                            <div className="flex items-center justify-between">
+                                                <p className="text-sm font-medium text-telegram-text">{t('settings.backup_protected_folders')}</p>
+                                                <button
+                                                    onClick={handleAddBackupFolder}
+                                                    disabled={addingBackupFolder}
+                                                    className="flex items-center gap-1.5 rounded-lg bg-telegram-primary/10 px-3 py-1.5 text-xs font-medium text-telegram-primary transition hover:bg-telegram-primary/20 disabled:opacity-50"
+                                                >
+                                                    <FolderPlus className="h-3.5 w-3.5" />
+                                                    {t('settings.backup_add_folder')}
+                                                </button>
+                                            </div>
+
+                                            {backupStatus.settings.sources.length === 0 ? (
+                                                <p className="py-2 text-center text-xs text-telegram-subtext">{t('settings.backup_no_folders')}</p>
+                                            ) : (
+                                                <div className="space-y-1.5">
+                                                    {backupStatus.settings.sources.map(source => (
+                                                        <div key={source.id} className="flex items-center justify-between gap-2 rounded-lg bg-telegram-bg p-2.5">
+                                                            <div className="min-w-0 flex-1">
+                                                                <p className="truncate text-sm text-telegram-text">{source.display_name}</p>
+                                                                <p className="truncate font-mono text-[11px] text-telegram-subtext">{source.local_path}</p>
+                                                                {backupStatus.running && backupStatus.current_source_id === source.id ? (
+                                                                    <p className="mt-0.5 text-[11px] text-telegram-primary">
+                                                                        {t('settings.backup_in_progress', { done: backupStatus.current_files_done, total: backupStatus.current_files_total })}
+                                                                    </p>
+                                                                ) : source.last_run_status === 'failed' ? (
+                                                                    <p className="mt-0.5 text-[11px] text-red-400">{source.last_error ?? t('settings.backup_status_failed')}</p>
+                                                                ) : source.last_run_at ? (
+                                                                    <p className="mt-0.5 text-[11px] text-telegram-subtext">
+                                                                        {t('settings.backup_last_run', { time: new Date(source.last_run_at * 1000).toLocaleString() })}
+                                                                    </p>
+                                                                ) : (
+                                                                    <p className="mt-0.5 text-[11px] text-telegram-subtext">{t('settings.backup_never_run')}</p>
+                                                                )}
+                                                            </div>
+                                                            <button
+                                                                onClick={() => setEditingExclusionsFor(source)}
+                                                                className={`shrink-0 rounded-md p-1.5 transition hover:bg-telegram-hover ${source.excluded_paths.length > 0 ? 'text-telegram-primary' : 'text-telegram-subtext hover:text-telegram-text'}`}
+                                                                title={source.excluded_paths.length > 0 ? t('settings.backup_exclude_count', { count: source.excluded_paths.length }) : t('settings.backup_exclude_title')}
+                                                            >
+                                                                <Ban className="h-3.5 w-3.5" />
+                                                            </button>
+                                                            <button
+                                                                onClick={() => handleToggleBackupFolder(source.id, !source.enabled)}
+                                                                aria-label={t('settings.backup_folder_enabled')}
+                                                                className={`relative h-5 w-9 shrink-0 rounded-full transition-colors duration-200 ${source.enabled ? 'bg-telegram-primary' : 'bg-telegram-border'}`}
+                                                            >
+                                                                <span className={`absolute left-0.5 top-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform duration-200 ${source.enabled ? 'translate-x-4' : 'translate-x-0'}`} />
+                                                            </button>
+                                                            <button
+                                                                onClick={() => handleRemoveBackupFolder(source.id, source.display_name)}
+                                                                className="shrink-0 rounded-md p-1.5 text-telegram-subtext transition hover:bg-telegram-hover hover:text-red-400"
+                                                                title={t('settings.backup_remove_confirm')}
+                                                            >
+                                                                <Trash2 className="h-3.5 w-3.5" />
+                                                            </button>
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            )}
+                                        </div>
+
+                                        {/* Backup All (OneDrive-style) */}
+                                        <button
+                                            onClick={handleBackupAll}
+                                            disabled={backupAllBusy}
+                                            className="flex w-full items-center justify-center gap-2 rounded-lg border border-telegram-border px-3 py-2.5 text-sm font-medium text-telegram-text transition hover:bg-telegram-hover disabled:opacity-50"
+                                        >
+                                            {backupAllBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Cloud className="h-4 w-4" />}
+                                            {t('settings.backup_all_button')}
+                                        </button>
+                                        <p className="-mt-2 text-[11px] text-telegram-subtext">{t('settings.backup_all_desc')}</p>
+
+                                        {/* Backup Now */}
+                                        <button
+                                            onClick={handleBackupNow}
+                                            disabled={backupBusy || backupStatus.running || backupStatus.settings.sources.length === 0}
+                                            className="flex w-full items-center justify-center gap-2 rounded-lg bg-telegram-primary px-3 py-2.5 text-sm font-medium text-white transition hover:bg-telegram-primary/90 disabled:opacity-50"
+                                        >
+                                            {(backupBusy || backupStatus.running) ? (
+                                                <>
+                                                    <Loader2 className="h-4 w-4 animate-spin" />
+                                                    {t('settings.backup_running')}
+                                                </>
+                                            ) : (
+                                                <>
+                                                    <Upload className="h-4 w-4" />
+                                                    {t('settings.backup_now')}
+                                                </>
+                                            )}
+                                        </button>
+                                        {backupStatus.running && (
+                                            <button
+                                                onClick={handleCancelBackup}
+                                                className="flex w-full items-center justify-center gap-2 rounded-lg border border-red-500/30 px-3 py-2 text-sm font-medium text-red-400 transition hover:bg-red-500/10"
+                                            >
+                                                {t('settings.backup_stop')}
+                                            </button>
+                                        )}
+
+                                        {/* Restore */}
+                                        <div className="space-y-2 rounded-lg bg-telegram-hover/50 p-3">
+                                            <p className="text-sm font-medium text-telegram-text">{t('settings.backup_restore_title')}</p>
+                                            <select
+                                                value={restoreTargetId ?? ''}
+                                                onChange={e => setRestoreTargetId(e.target.value || null)}
+                                                className="w-full rounded-md border border-telegram-border bg-telegram-bg px-2 py-1.5 text-sm text-telegram-text outline-none transition focus:border-telegram-primary/50"
+                                            >
+                                                <option value="">{t('settings.backup_restore_select')}</option>
+                                                {backupStatus.settings.sources.filter(s => s.channel_id !== null).map(source => (
+                                                    <option key={source.id} value={source.id}>{source.display_name}</option>
+                                                ))}
+                                            </select>
+                                            <div className="flex items-center gap-2">
+                                                <input
+                                                    type="text"
+                                                    value={restorePath}
+                                                    onChange={e => setRestorePath(e.target.value)}
+                                                    placeholder={t('settings.backup_restore_path_placeholder')}
+                                                    className="min-w-0 flex-1 rounded-md border border-telegram-border bg-telegram-bg px-2 py-1.5 text-sm text-telegram-text outline-none transition focus:border-telegram-primary/50"
+                                                />
+                                                <button
+                                                    onClick={handlePickRestoreFolder}
+                                                    className="shrink-0 rounded-md border border-telegram-border p-1.5 text-telegram-subtext transition hover:bg-telegram-hover hover:text-telegram-text"
+                                                    title={t('settings.backup_restore_browse')}
+                                                >
+                                                    <FolderOpen className="h-4 w-4" />
+                                                </button>
+                                            </div>
+                                            <button
+                                                onClick={handleRestore}
+                                                disabled={restoring || backupStatus.running || !restoreTargetId || !restorePath.trim()}
+                                                className="flex w-full items-center justify-center gap-2 rounded-lg border border-telegram-primary/30 px-3 py-2 text-sm font-medium text-telegram-primary transition hover:bg-telegram-primary/10 disabled:opacity-50"
+                                            >
+                                                {restoring ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+                                                {t('settings.backup_restore_action')}
+                                            </button>
+                                        </div>
+                                    </motion.section>
+                                )}
+                                {activeTab === 'google' && (
+                                    <motion.section
+                                        key="google"
+                                        initial={{ opacity: 0 }}
+                                        animate={{ opacity: 1 }}
+                                        exit={{ opacity: 0 }}
+                                        transition={{ duration: 0.12, ease: [0.2, 0.8, 0.2, 1] }}
+                                        className="space-y-4 w-full"
+                                    >
+                                        <div className="flex items-start gap-3 rounded-lg border border-telegram-primary/20 bg-telegram-primary/5 p-3">
+                                            <GoogleGlyph className="mt-0.5 h-4 w-4 shrink-0" />
+                                            <div>
+                                                <h3 className="text-sm font-semibold text-telegram-text">{t('settings.google_title')}</h3>
+                                                <p className="mt-1 text-xs leading-relaxed text-telegram-subtext">{t('settings.google_description')}</p>
+                                            </div>
+                                        </div>
+
+                                        {googleAccount?.connected ? (
+                                            <>
+                                            <div className="flex items-center justify-between rounded-lg bg-telegram-hover/50 p-3">
+                                                <div className="flex items-center gap-2 min-w-0">
+                                                    <GoogleGlyph />
+                                                    <span className="text-sm text-telegram-text truncate">{googleAccount.account_email}</span>
+                                                </div>
+                                                <button
+                                                    onClick={handleGoogleSignOut}
+                                                    className="flex shrink-0 items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium text-red-400 transition hover:bg-red-500/10"
+                                                >
+                                                    <LogOut className="h-3.5 w-3.5" />
+                                                    {t('settings.google_disconnect')}
+                                                </button>
+                                            </div>
+
+                                            <div className="space-y-2.5 rounded-lg border border-telegram-border/50 bg-telegram-hover/30 p-3">
+                                                <div className="flex items-start gap-2">
+                                                    <KeyRound className="mt-0.5 h-4 w-4 shrink-0 text-telegram-primary" />
+                                                    <div>
+                                                        <h4 className="text-sm font-semibold text-telegram-text">{t('settings.totp_title')}</h4>
+                                                        <p className="mt-0.5 text-xs leading-relaxed text-telegram-subtext">{t('settings.totp_desc')}</p>
+                                                    </div>
+                                                </div>
+
+                                                {totpSetupData ? (
+                                                    <div className="space-y-3 rounded-lg bg-telegram-bg p-3">
+                                                        <p className="text-xs text-telegram-subtext leading-relaxed">{t('settings.totp_scan_instructions')}</p>
+                                                        <div
+                                                            className="mx-auto w-fit rounded-lg bg-white p-2"
+                                                            dangerouslySetInnerHTML={{ __html: totpSetupData.qrSvg }}
+                                                        />
+                                                        <div className="space-y-1">
+                                                            <label className="text-xs font-medium text-telegram-text">{t('settings.totp_setup_key_label')}</label>
+                                                            <div className="flex items-center gap-2">
+                                                                <input
+                                                                    type="text"
+                                                                    readOnly
+                                                                    value={totpSetupData.base32Secret}
+                                                                    className="flex-1 bg-telegram-hover/50 border border-telegram-border rounded-md px-3 py-1.5 text-xs text-telegram-text font-mono select-all"
+                                                                />
+                                                                <button
+                                                                    onClick={() => { navigator.clipboard.writeText(totpSetupData.base32Secret); toast.success(t('common.copied')); }}
+                                                                    className="shrink-0 rounded-lg p-1.5 text-telegram-subtext transition hover:bg-telegram-hover hover:text-telegram-text"
+                                                                    title={t('common.copy')}
+                                                                >
+                                                                    <Copy className="h-3.5 w-3.5" />
+                                                                </button>
+                                                            </div>
+                                                            <p className="text-xs text-amber-400 leading-relaxed">{t('settings.totp_setup_key_warning')}</p>
+                                                        </div>
+                                                        <div className="space-y-1">
+                                                            <label className="text-xs font-medium text-telegram-text">{t('settings.totp_confirm_code_label')}</label>
+                                                            <input
+                                                                type="text"
+                                                                inputMode="numeric"
+                                                                value={totpConfirmCode}
+                                                                onChange={e => setTotpConfirmCode(e.target.value)}
+                                                                placeholder="123456"
+                                                                className="w-full bg-telegram-hover/50 border border-telegram-border rounded-md px-3 py-1.5 text-sm text-telegram-text font-mono text-center tracking-[0.3em] focus:outline-none focus:border-telegram-primary/50"
+                                                            />
+                                                        </div>
+                                                        <div className="flex items-center gap-2">
+                                                            <button
+                                                                onClick={handleConfirmTotpSetup}
+                                                                disabled={totpBusy || totpConfirmCode.trim().length !== 6}
+                                                                className="flex-1 flex items-center justify-center gap-1.5 rounded-lg bg-telegram-primary/10 px-3 py-1.5 text-xs font-medium text-telegram-primary transition hover:bg-telegram-primary/20 disabled:opacity-50"
+                                                            >
+                                                                {totpBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Check className="h-3.5 w-3.5" />}
+                                                                {t('settings.totp_confirm_button')}
+                                                            </button>
+                                                            <button
+                                                                onClick={() => { setTotpSetupData(null); setTotpConfirmCode(''); }}
+                                                                className="rounded-lg px-3 py-1.5 text-xs font-medium text-telegram-subtext transition hover:bg-telegram-hover hover:text-telegram-text"
+                                                            >
+                                                                {t('common.cancel')}
+                                                            </button>
+                                                        </div>
+                                                    </div>
+                                                ) : totpEnabled ? (
+                                                    <div className="flex items-center justify-between rounded-lg bg-telegram-bg p-2.5">
+                                                        <div className="flex items-center gap-2 min-w-0">
+                                                            <Check className="h-4 w-4 shrink-0 text-emerald-400" />
+                                                            <span className="text-sm text-telegram-text">{t('settings.totp_enabled')}</span>
+                                                        </div>
+                                                        <button
+                                                            onClick={handleDisableTotp}
+                                                            disabled={totpBusy}
+                                                            className="shrink-0 rounded-lg px-3 py-1.5 text-xs font-medium text-red-400 transition hover:bg-red-500/10 disabled:opacity-50"
+                                                        >
+                                                            {t('settings.totp_disable_button')}
+                                                        </button>
+                                                    </div>
+                                                ) : (
+                                                    <button
+                                                        onClick={handleStartTotpSetup}
+                                                        disabled={totpBusy}
+                                                        className="w-full flex items-center justify-center gap-2 rounded-lg border border-telegram-border px-3 py-2.5 text-sm font-medium text-telegram-text transition hover:bg-telegram-hover disabled:opacity-50"
+                                                    >
+                                                        {totpBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <KeyRound className="h-4 w-4" />}
+                                                        {t('settings.totp_setup_button')}
+                                                    </button>
+                                                )}
+                                            </div>
+                                            </>
+                                        ) : (
+                                            <>
+                                                {googleAccount?.client_configured && !editingGoogleClient ? (
+                                                    <div className="flex items-center justify-between rounded-lg bg-telegram-hover/50 p-3">
+                                                        <div className="flex items-center gap-2 min-w-0">
+                                                            <Check className="h-4 w-4 shrink-0 text-emerald-400" />
+                                                            <span className="text-sm text-telegram-text">{t('settings.google_client_configured')}</span>
+                                                        </div>
+                                                        <button
+                                                            onClick={() => setEditingGoogleClient(true)}
+                                                            className="shrink-0 rounded-lg px-3 py-1.5 text-xs font-medium text-telegram-subtext transition hover:bg-telegram-hover hover:text-telegram-text"
+                                                        >
+                                                            {t('settings.google_client_change')}
+                                                        </button>
+                                                    </div>
+                                                ) : (
+                                                    <div className="space-y-2.5 rounded-lg bg-telegram-hover/50 p-3">
+                                                        <p className="text-xs text-telegram-subtext leading-relaxed">{t('settings.google_client_desc')}</p>
+                                                        <div className="space-y-1">
+                                                            <label className="text-xs font-medium text-telegram-text">{t('settings.google_client_id')}</label>
+                                                            <input
+                                                                type="text"
+                                                                value={googleClientIdInput}
+                                                                onChange={e => setGoogleClientIdInput(e.target.value)}
+                                                                placeholder="xxxxx.apps.googleusercontent.com"
+                                                                className="w-full bg-telegram-bg border border-telegram-border rounded-md px-3 py-1.5 text-sm text-telegram-text font-mono focus:outline-none focus:border-telegram-primary/50 transition"
+                                                            />
+                                                        </div>
+                                                        <div className="space-y-1">
+                                                            <label className="text-xs font-medium text-telegram-text">{t('settings.google_client_secret')}</label>
+                                                            <input
+                                                                type="text"
+                                                                value={googleClientSecretInput}
+                                                                onChange={e => setGoogleClientSecretInput(e.target.value)}
+                                                                placeholder="GOCSPX-..."
+                                                                autoComplete="off"
+                                                                className="w-full bg-telegram-bg border border-telegram-border rounded-md px-3 py-1.5 text-sm text-telegram-text font-mono focus:outline-none focus:border-telegram-primary/50 transition"
+                                                            />
+                                                        </div>
+                                                        <div className="flex items-center gap-2">
+                                                            <button
+                                                                onClick={handleSaveGoogleClient}
+                                                                disabled={savingGoogleClient}
+                                                                className="flex-1 flex items-center justify-center gap-1.5 rounded-lg bg-telegram-primary/10 px-3 py-1.5 text-xs font-medium text-telegram-primary transition hover:bg-telegram-primary/20 disabled:opacity-50"
+                                                            >
+                                                                {savingGoogleClient ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Check className="h-3.5 w-3.5" />}
+                                                                {t('settings.google_client_save')}
+                                                            </button>
+                                                            {googleAccount?.client_configured && (
+                                                                <button
+                                                                    onClick={() => {
+                                                                        setEditingGoogleClient(false);
+                                                                        setGoogleClientIdInput(googleAccount?.client_id ?? '');
+                                                                        setGoogleClientSecretInput(googleAccount?.client_secret ?? '');
+                                                                    }}
+                                                                    className="rounded-lg px-3 py-1.5 text-xs font-medium text-telegram-subtext transition hover:bg-telegram-hover hover:text-telegram-text"
+                                                                >
+                                                                    {t('common.cancel')}
+                                                                </button>
+                                                            )}
+                                                        </div>
+                                                    </div>
+                                                )}
+
+                                                <button
+                                                    onClick={async () => { if (await googleOauth.start()) { /* polling started */ } }}
+                                                    disabled={!googleAccount?.client_configured || googleOauth.polling}
+                                                    className="w-full flex items-center justify-center gap-2 rounded-lg border border-telegram-border px-3 py-2.5 text-sm font-medium text-telegram-text transition hover:bg-telegram-hover disabled:opacity-50"
+                                                >
+                                                    {googleOauth.polling ? (
+                                                        <>
+                                                            <Loader2 className="h-4 w-4 animate-spin" />
+                                                            {t('settings.google_connecting')}
+                                                        </>
+                                                    ) : (
+                                                        <>
+                                                            <GoogleGlyph />
+                                                            {t('settings.google_connect')}
+                                                        </>
+                                                    )}
+                                                </button>
+                                                {googleOauth.polling && (
+                                                    <button
+                                                        onClick={() => googleOauth.cancel()}
+                                                        className="w-full text-xs text-telegram-subtext hover:text-telegram-text transition"
+                                                    >
+                                                        {t('common.cancel')}
+                                                    </button>
+                                                )}
+                                            </>
+                                        )}
+                                    </motion.section>
+                                )}
+                                {activeTab === 'app-lock' && (
+                                    <motion.section
+                                        key="app-lock"
+                                        initial={{ opacity: 0 }}
+                                        animate={{ opacity: 1 }}
+                                        exit={{ opacity: 0 }}
+                                        transition={{ duration: 0.12, ease: [0.2, 0.8, 0.2, 1] }}
+                                        className="space-y-4 w-full"
+                                    >
+                                        <div className="flex items-start gap-3 rounded-lg border border-telegram-primary/20 bg-telegram-primary/5 p-3">
+                                            <Lock className="mt-0.5 h-4 w-4 shrink-0 text-telegram-primary" />
+                                            <div>
+                                                <h3 className="text-sm font-semibold text-telegram-text">{t('settings.app_lock_title')}</h3>
+                                                <p className="mt-1 text-xs leading-relaxed text-telegram-subtext">{t('settings.app_lock_description')}</p>
+                                            </div>
+                                        </div>
+
+                                        {/* Email sender (SMTP) — required before app lock can send codes */}
+                                        <div className="space-y-2.5 rounded-lg bg-telegram-hover/50 p-3">
+                                            <div className="flex items-center gap-2 text-sm font-medium text-telegram-text">
+                                                <Mail className="h-4 w-4 text-telegram-subtext" />
+                                                {t('settings.smtp_title')}
+                                            </div>
+                                            <p className="text-xs text-telegram-subtext leading-relaxed">{t('settings.smtp_desc')}</p>
+                                            {smtpSettings?.configured && (
+                                                <p className="text-xs text-emerald-400">{t('settings.smtp_configured_as', { email: smtpSettings.gmail_address })}</p>
+                                            )}
+                                            <div className="space-y-1">
+                                                <label className="text-xs font-medium text-telegram-text">{t('settings.smtp_gmail_address')}</label>
+                                                <input
+                                                    type="email"
+                                                    value={smtpGmailInput}
+                                                    onChange={e => setSmtpGmailInput(e.target.value)}
+                                                    placeholder="you@gmail.com"
+                                                    className="w-full bg-telegram-bg border border-telegram-border rounded-md px-3 py-1.5 text-sm text-telegram-text focus:outline-none focus:border-telegram-primary/50 transition"
+                                                />
+                                            </div>
+                                            <div className="space-y-1">
+                                                <label className="text-xs font-medium text-telegram-text">{t('settings.smtp_app_password')}</label>
+                                                <input
+                                                    type="password"
+                                                    value={smtpAppPasswordInput}
+                                                    onChange={e => setSmtpAppPasswordInput(e.target.value)}
+                                                    placeholder="xxxx xxxx xxxx xxxx"
+                                                    autoComplete="off"
+                                                    className="w-full bg-telegram-bg border border-telegram-border rounded-md px-3 py-1.5 text-sm text-telegram-text font-mono focus:outline-none focus:border-telegram-primary/50 transition"
+                                                />
+                                            </div>
+                                            <button
+                                                onClick={handleSaveSmtp}
+                                                disabled={savingSmtp}
+                                                className="w-full flex items-center justify-center gap-1.5 rounded-lg bg-telegram-primary/10 px-3 py-1.5 text-xs font-medium text-telegram-primary transition hover:bg-telegram-primary/20 disabled:opacity-50"
+                                            >
+                                                {savingSmtp ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Check className="h-3.5 w-3.5" />}
+                                                {t('settings.smtp_save')}
+                                            </button>
+                                        </div>
+
+                                        {/* App lock itself */}
+                                        {appLockStatus?.enabled && !showAppLockSetup ? (
+                                            <div className="space-y-2.5 rounded-lg bg-telegram-hover/50 p-3">
+                                                <div className="flex items-center justify-between">
+                                                    <div>
+                                                        <p className="text-sm font-medium text-telegram-text">{t('settings.app_lock_enabled')}</p>
+                                                        <p className="text-xs text-telegram-subtext">{appLockStatus.email}</p>
+                                                    </div>
+                                                    <button
+                                                        onClick={() => handleToggleAppLock(false)}
+                                                        className="relative h-6 w-11 shrink-0 rounded-full bg-telegram-primary transition-colors duration-200"
+                                                        aria-label={t('settings.app_lock_enabled')}
+                                                    >
+                                                        <span className="absolute left-0.5 top-0.5 h-5 w-5 translate-x-5 rounded-full bg-white shadow transition-transform duration-200" />
+                                                    </button>
+                                                </div>
+                                                <button
+                                                    onClick={() => setShowAppLockSetup(true)}
+                                                    className="w-full rounded-lg border border-telegram-border px-3 py-1.5 text-xs font-medium text-telegram-text transition hover:bg-telegram-hover"
+                                                >
+                                                    {t('settings.app_lock_change_password')}
+                                                </button>
+                                            </div>
+                                        ) : !showAppLockSetup ? (
+                                            <div className="space-y-2 rounded-lg bg-telegram-hover/50 p-3">
+                                                {appLockStatus && !appLockStatus.enabled && appLockStatus.email && (
+                                                    <div className="flex items-center justify-between">
+                                                        <p className="text-xs text-telegram-subtext">{t('settings.app_lock_disabled_desc')}</p>
+                                                        <button
+                                                            onClick={() => handleToggleAppLock(true)}
+                                                            className="relative h-6 w-11 shrink-0 rounded-full bg-telegram-border transition-colors duration-200"
+                                                            aria-label={t('settings.app_lock_enabled')}
+                                                        >
+                                                            <span className="absolute left-0.5 top-0.5 h-5 w-5 rounded-full bg-white shadow transition-transform duration-200" />
+                                                        </button>
+                                                    </div>
+                                                )}
+                                                <button
+                                                    onClick={() => setShowAppLockSetup(true)}
+                                                    disabled={!smtpSettings?.configured}
+                                                    className="w-full flex items-center justify-center gap-2 rounded-lg bg-telegram-primary/10 px-3 py-2 text-sm font-medium text-telegram-primary transition hover:bg-telegram-primary/20 disabled:opacity-50"
+                                                >
+                                                    <Lock className="h-4 w-4" />
+                                                    {t('settings.app_lock_set_up')}
+                                                </button>
+                                                {!smtpSettings?.configured && (
+                                                    <p className="text-[11px] text-telegram-subtext">{t('settings.app_lock_needs_smtp')}</p>
+                                                )}
+                                            </div>
+                                        ) : (
+                                            <div className="rounded-lg bg-telegram-hover/50 p-3">
+                                                <AppLockSetupFlow
+                                                    mode={appLockStatus?.enabled ? 'reset' : 'setup'}
+                                                    initialEmail={appLockStatus?.email ?? ''}
+                                                    onComplete={() => { setShowAppLockSetup(false); fetchAppLockStatus(); toast.success(t('settings.app_lock_saved')); }}
+                                                    onCancel={() => setShowAppLockSetup(false)}
+                                                />
                                             </div>
                                         )}
                                     </motion.section>
@@ -2050,6 +3620,37 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                 </motion.div>
             )}
         </AnimatePresence>
+        {showTempLinkGenerator && (
+            <TempLinkGeneratorModal
+                folders={folders}
+                onClose={() => { setShowTempLinkGenerator(false); fetchShares(); }}
+                onFolderCreated={() => { /* folder list refresh is owned by DesktopDashboard's query */ }}
+            />
+        )}
+        {pendingBackupLocalPath && !showBackupExcludeStep && (
+            <BackupDestinationModal
+                folders={folders}
+                onClose={handleCancelBackupAdd}
+                onSelect={handleDestinationChosen}
+            />
+        )}
+        {pendingBackupLocalPath && showBackupExcludeStep && (
+            <BackupExcludeModal
+                rootPath={pendingBackupLocalPath}
+                initialExcluded={[]}
+                onClose={handleCancelBackupAdd}
+                onConfirm={handleConfirmBackupDestination}
+            />
+        )}
+        {editingExclusionsFor && (
+            <BackupExcludeModal
+                rootPath={editingExclusionsFor.local_path}
+                initialExcluded={editingExclusionsFor.excluded_paths}
+                onClose={() => setEditingExclusionsFor(null)}
+                onConfirm={handleSaveExclusions}
+            />
+        )}
+        </>
     );
 }
 

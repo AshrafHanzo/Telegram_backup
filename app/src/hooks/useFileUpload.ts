@@ -34,7 +34,21 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
     const [uploadQueue, setUploadQueue] = useState<QueueItem[]>([]);
     const [initialized, setInitialized] = useState(false);
     const cancelledRef = useRef<Set<string>>(new Set());
+    // Tracks cancel requests that have been sent to the backend but not yet
+    // acknowledged, keyed by transfer id. Lets `retryItem` wait for a cancel
+    // to actually land before re-queuing the same id, so a fast Cancel then
+    // Retry can't result in two concurrent backend transfers sharing one id.
+    const cancellingRef = useRef<Map<string, Promise<void>>>(new Map());
     const activeCountRef = useRef(0);
+
+    const requestCancel = (id: string): Promise<void> => {
+        cancelledRef.current.add(id);
+        const cancelPromise = invoke('cmd_cancel_transfer', { transferId: id })
+            .catch(() => {})
+            .finally(() => { cancellingRef.current.delete(id); }) as Promise<void>;
+        cancellingRef.current.set(id, cancelPromise);
+        return cancelPromise;
+    };
 
     // Listen for progress events from Rust
     useEffect(() => {
@@ -384,8 +398,7 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
         setUploadQueue(q => {
             const activeItems = q.filter(i => i.status === 'uploading' || i.status === 'downloading');
             for (const item of activeItems) {
-                cancelledRef.current.add(item.id);
-                invoke('cmd_cancel_transfer', { transferId: item.id }).catch(() => {});
+                requestCancel(item.id);
             }
             return q
                 .filter(i => i.status !== 'pending')
@@ -398,8 +411,7 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
         setUploadQueue(q => {
             const item = q.find(i => i.id === id);
             if (item?.status === 'uploading' || item?.status === 'downloading') {
-                cancelledRef.current.add(id);
-                invoke('cmd_cancel_transfer', { transferId: id }).catch(() => {});
+                requestCancel(id);
                 return q.map(i => i.id === id ? { ...i, status: 'cancelled' as const } : i);
             }
             // Remove pending items directly
@@ -411,6 +423,12 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
     };
 
     const retryItem = async (id: string) => {
+        // If a cancel for this id was just requested, wait for the backend to
+        // acknowledge it before re-queuing — otherwise the retried transfer
+        // could start under the same id while the old one is still winding down.
+        const pendingCancel = cancellingRef.current.get(id);
+        if (pendingCancel) await pendingCancel;
+
         const item = uploadQueue.find(candidate => candidate.id === id);
         if (!item || !['error', 'cancelled', 'waiting_for_unlock'].includes(item.status)) return;
         let protection = item.protection;

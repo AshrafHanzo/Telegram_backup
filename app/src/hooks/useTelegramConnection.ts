@@ -36,7 +36,8 @@ export function useTelegramConnection(onLogoutParent: () => void) {
 
     // Load persisted store and restore saved folders.
     useEffect(() => {
-        const initStore = async () => {
+        let cancelled = false;
+        const initStore = async (attempt = 0) => {
             try {
                 let _store = await load('config.json');
                 const checkId = await _store.get<string>('api_id');
@@ -73,11 +74,24 @@ export function useTelegramConnection(onLogoutParent: () => void) {
                 // a second overlapping request for the actual startup folder.
                 setStore(_store);
                 setIsConnected(true);
-            } catch {
-                // store not available
+            } catch (e) {
+                if (cancelled) return;
+                // One cheap automatic retry — covers transient startup hiccups
+                // (e.g. the store backend not quite ready yet) — before giving
+                // up and surfacing the failure. Without this, an early load()
+                // failure left `store` permanently null with no error shown,
+                // silently disabling file loading for the rest of the session.
+                if (attempt === 0) {
+                    console.warn("Failed to load persisted settings/config store, retrying:", e);
+                    setTimeout(() => { if (!cancelled) initStore(1); }, 1500);
+                    return;
+                }
+                console.error("Failed to load persisted settings/config store:", e);
+                toast.error("Failed to load app settings. Files may not appear until you restart the app.");
             }
         };
         initStore();
+        return () => { cancelled = true; };
     }, [queryClient]);
 
     // Consolidated mount-sync + visibility-change listener

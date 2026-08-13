@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { load } from "@tauri-apps/plugin-store";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { AuthWizard } from "./components/shared/AuthWizard";
-import { AdGateway } from "./components/shared/AdGateway";
+import { AppLockScreen } from "./components/shared/AppLockScreen";
 import { ErrorBoundary } from "./components/shared/ErrorBoundary";
 import { UpdateBanner } from "./components/shared/UpdateBanner";
 import { useUpdateCheck } from "./hooks/useUpdateCheck";
@@ -19,7 +19,7 @@ const DesignGallery = import.meta.env.DEV
   ? React.lazy(() => import("./components/dev/DesignGallery"))
   : null;
 
-import { Toaster, toast } from "sonner";
+import { Toaster } from "sonner";
 import { ConfirmProvider } from "./context/ConfirmContext";
 import { ThemeProvider, useTheme } from "./context/ThemeContext";
 import { SettingsProvider } from "./context/SettingsContext";
@@ -29,13 +29,36 @@ import { useTranslation } from "react-i18next";
 
 import { getLanguageInfo } from "./i18n/languages";
 import { resolveLanguagePreference } from "./i18n/resolveLanguage";
+import { pullAndApplyGoogleDriveSync } from "./services/googleDriveSync";
 
 const queryClient = new QueryClient();
 
-type AuthStatus = "loading" | "authenticated" | "unauthenticated" | "ad-gateway";
+type AuthStatus = "loading" | "authenticated" | "unauthenticated" | "app-lock";
 
 function AppContent() {
   const [authStatus, setAuthStatus] = useState<AuthStatus>("loading");
+
+  // The last gate before the dashboard: if the user has an app lock
+  // configured (email+password, set via Settings or an OTP-reset flow),
+  // require it every launch; otherwise go straight in.
+  const finishLogin = async () => {
+    // Best-effort, fire-and-forget: keeps the Drive-synced session fresh on
+    // every confirmed-good login if the authenticator is set up on this
+    // device (a no-op otherwise) — never worth blocking or failing login over.
+    invoke("cmd_totp_resync_session").catch(() => {});
+    // Best-effort, fire-and-forget: pulls Drive-synced api_id/api_hash and
+    // (as a side effect of the backend command) refreshes the App Lock
+    // cache on every launch when signed into Google — a no-op otherwise.
+    // Mirrors mobile's now-fixed `authStore.init()`, which does the same
+    // unconditional pull. Never worth blocking or failing login over.
+    pullAndApplyGoogleDriveSync().catch(() => {});
+    try {
+      const status = await invoke<{ enabled: boolean; email: string | null }>("cmd_get_app_lock_status");
+      setAuthStatus(status.enabled ? "app-lock" : "authenticated");
+    } catch {
+      setAuthStatus("authenticated");
+    }
+  };
   const { theme } = useTheme();
   const { available, version, downloading, progress, downloadAndInstall, dismissUpdate } = useUpdateCheck();
   const { isMobile } = usePlatform();
@@ -103,13 +126,7 @@ function AppContent() {
         // Verify the session is still valid with Telegram servers
         const ok = await invoke<boolean>("cmd_check_connection");
         if (ok) {
-          // Check if user already passed the ad gateway — skip it if so
-          const gatewayPassed = await store.get<boolean>("ad_gateway_passed");
-          if (gatewayPassed) {
-            setAuthStatus("authenticated");
-          } else {
-            setAuthStatus("ad-gateway");
-          }
+          await finishLogin();
         } else {
           setAuthStatus("unauthenticated");
         }
@@ -129,35 +146,6 @@ function AppContent() {
 
     checkSession();
   }, []);
-
-  // Show thank-you toast when user enters the app after clicking the ad
-  useEffect(() => {
-    if (authStatus !== "authenticated") return;
-
-    const showThanks = async () => {
-      try {
-        const store = await load("config.json");
-        const shouldThank = await store.get<boolean>("ad_click_thanks");
-        if (shouldThank) {
-          await store.delete("ad_click_thanks");
-          await store.save();
-          toast.success("Thanks for your support! ", {
-            duration: 3000,
-            style: {
-              background: "rgba(255,255,255,0.08)",
-              border: "1px solid rgba(255,255,255,0.1)",
-            },
-          });
-        }
-      } catch {
-        // Non-critical
-      }
-    };
-
-    // Small delay to let the dashboard finish mounting
-    const timer = setTimeout(showThanks, 600);
-    return () => clearTimeout(timer);
-  }, [authStatus]);
 
   // Styled splash screen while verifying the session
   if (authStatus === "loading") {
@@ -182,8 +170,8 @@ function AppContent() {
         onDismiss={dismissUpdate}
       />
       <Toaster theme={theme} position="bottom-center" />
-      {authStatus === "ad-gateway" && (
-        <AdGateway onContinue={() => setAuthStatus("authenticated")} />
+      {authStatus === "app-lock" && (
+        <AppLockScreen onUnlock={() => setAuthStatus("authenticated")} />
       )}
       {authStatus === "authenticated" && (
         <Suspense fallback={
@@ -203,7 +191,7 @@ function AppContent() {
         </Suspense>
       )}
       {authStatus === "unauthenticated" && (
-        <AuthWizard onLogin={() => setAuthStatus("ad-gateway")} />
+        <AuthWizard onLogin={() => { void finishLogin(); }} />
       )}
     </main>
   );

@@ -82,4 +82,5 @@ pub mod domains {
     pub const CACHE_ENC: &[u8] = b"telegram-drive:cache-enc:v1";
     pub const SEARCH_INDEX: &[u8] = b"telegram-drive:search-index:v1";
     pub const RECOVERY_EXPORT: &[u8] = b"telegram-drive:recovery-export:v2";
+    pub const TOTP_SESSION_WRAP: &[u8] = b"telegram-drive:totp-session-wrap:v1";
 }

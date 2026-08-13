@@ -100,6 +100,7 @@ interface SidebarProps {
     onRename: (id: number, name: string) => void;
     onToggleVisibility: (id: number, name: string, isPublic: boolean) => void;
     onExportInvite: (id: number, name: string) => void;
+    onGenerateTempLink?: (id: number | null, name: string) => void;
     onCreate: (name: string) => Promise<void>;
     isSyncing: boolean;
     isConnected: boolean;
@@ -113,7 +114,7 @@ interface SidebarProps {
 }
 
 export function Sidebar({
-    folders, groups = [], activeFolderId, setActiveFolderId, onDelete, onRename, onToggleVisibility, onExportInvite, onCreate,
+    folders, groups = [], activeFolderId, setActiveFolderId, onDelete, onRename, onToggleVisibility, onExportInvite, onGenerateTempLink, onCreate,
     isSyncing, isConnected, onSync, onLogout, bandwidth,
     onAssignFolderToGroup, onCreateGroup, onUpdateGroup, onDeleteGroup
 }: SidebarProps) {
@@ -135,6 +136,10 @@ export function Sidebar({
             await onCreate(newFolderName);
             setNewFolderName("");
             setShowNewFolderInput(false);
+            // New folders always start ungrouped — jump back to "All" so the
+            // one you just created is guaranteed visible immediately instead
+            // of silently landing in a group tab you're not currently viewing.
+            setActiveGroupId('all');
         } catch {
             // handled by parent
         }
@@ -369,6 +374,7 @@ export function Sidebar({
                                 onRename={() => onRename(folder.id, folder.name)}
                                 onToggleVisibility={() => onToggleVisibility(folder.id, folder.name, !!(folder.is_public || folder.username))}
                                 onExportInvite={() => onExportInvite(folder.id, folder.name)}
+                                onGenerateTempLink={onGenerateTempLink ? () => onGenerateTempLink(folder.id, folder.name) : undefined}
                                 folderId={folder.id}
                                 isPublic={!!(folder.is_public || folder.username)}
                                 collapsed={settings.sidebarCollapsed}

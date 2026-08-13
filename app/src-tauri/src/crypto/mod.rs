@@ -10,5 +10,6 @@ pub mod byte_source;
 pub mod cache;
 pub mod lease;
 pub mod state;
+pub mod totp;
 
 pub use error::CryptoError;

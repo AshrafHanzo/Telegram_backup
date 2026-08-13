@@ -2,8 +2,8 @@ use actix_web::{get, post, web, HttpRequest, HttpResponse, Responder, cookie::Co
 use crate::commands::TelegramState;
 use crate::commands::utils::resolve_peer;
 use crate::db::DbConnection;
+use crate::share_common::{escape_html, generate_cookie_val, resolve_req_lang, verify_cookie_val, verify_password, VerifyRateLimiter};
 use grammers_client::types::Media;
-use sha2::{Sha256, Digest};
 use std::sync::Arc;
 use serde::Deserialize;
 
@@ -25,27 +25,15 @@ struct VerifyForm {
     password: String,
 }
 
-/// Verify a password against a bcrypt hash.
-fn verify_password(password: &str, hash: &str) -> bool {
-    bcrypt::verify(password, hash).unwrap_or(false)
-}
-
-fn generate_cookie_val(token: &str, password_hash: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(token.as_bytes());
-    hasher.update(password_hash.as_bytes());
-    format!("{:x}", hasher.finalize())
-}
-
 fn get_share_by_token(db: &DbConnection, token: &str) -> Result<Option<SharedLinkRow>, String> {
     let conn = db.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, folder_id, message_id, file_name, file_size, password_hash, password_salt, expires_at, revoked 
+            "SELECT id, folder_id, message_id, file_name, file_size, password_hash, password_salt, expires_at, revoked
              FROM shared_links WHERE id = ?"
         )
         .map_err(|e| e.to_string())?;
-    
+
     stmt.bind((1, token)).map_err(|e| e.to_string())?;
 
     if let sqlite::State::Row = stmt.next().map_err(|e| e.to_string())? {
@@ -75,6 +63,28 @@ fn get_share_by_token(db: &DbConnection, token: &str) -> Result<Option<SharedLin
     }
 }
 
+/// Atomically increments `usage_count`, but only if the link hasn't already
+/// hit its `usage_limit` — a single conditional `UPDATE ... WHERE usage_count
+/// < usage_limit` instead of a separate check-then-increment, which closes
+/// the race where two near-simultaneous requests against a `usage_limit = 1`
+/// link could both pass an earlier, unlocked `usage_count >= usage_limit`
+/// check before either had incremented. Returns `true` if the increment
+/// applied (the caller may proceed to serve the file), `false` if the limit
+/// had already been reached (by this call or a concurrent one) — no row is
+/// touched in that case.
+fn try_increment_share_usage(db: &DbConnection, token: &str) -> Result<bool, String> {
+    let conn = db.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "UPDATE shared_links SET usage_count = usage_count + 1 \
+             WHERE id = ? AND (usage_limit IS NULL OR usage_count < usage_limit)",
+        )
+        .map_err(|e| e.to_string())?;
+    stmt.bind((1, token)).map_err(|e| e.to_string())?;
+    stmt.next().map_err(|e| e.to_string())?;
+    Ok(conn.change_count() > 0)
+}
+
 /// Renders the password entry form for protected share links.
 ///
 /// NOTE: This HTML contains an inline `<style>` block which requires
@@ -82,40 +92,6 @@ fn get_share_by_token(db: &DbConnection, token: &str) -> Result<Option<SharedLin
 /// This is acceptable because the page is served only over the local
 /// Actix streaming server (127.0.0.1/0.0.0.0:14201), not the public internet,
 /// so the XSS attack surface is minimal.
-fn escape_html(input: &str) -> String {
-    input.replace('&', "&amp;")
-         .replace('<', "&lt;")
-         .replace('>', "&gt;")
-         .replace('"', "&quot;")
-         .replace('\'', "&#x27;")
-}
-
-fn resolve_req_lang(req: &HttpRequest) -> (&'static str, &'static str) {
-    if let Some(query) = req.uri().query() {
-        if query.contains("lang=ar") { return ("ar", "rtl"); }
-        if query.contains("lang=es") { return ("es", "ltr"); }
-        if query.contains("lang=ru") { return ("ru", "ltr"); }
-        if query.contains("lang=fr") { return ("fr", "ltr"); }
-        if query.contains("lang=de") { return ("de", "ltr"); }
-        if query.contains("lang=pt") { return ("pt-BR", "ltr"); }
-        if query.contains("lang=zh") { return ("zh-CN", "ltr"); }
-        if query.contains("lang=vi") { return ("vi", "ltr"); }
-    }
-    if let Some(accept) = req.headers().get("Accept-Language") {
-        if let Ok(val) = accept.to_str() {
-            if val.contains("ar") { return ("ar", "rtl"); }
-            if val.contains("es") { return ("es", "ltr"); }
-            if val.contains("ru") { return ("ru", "ltr"); }
-            if val.contains("fr") { return ("fr", "ltr"); }
-            if val.contains("de") { return ("de", "ltr"); }
-            if val.contains("pt") { return ("pt-BR", "ltr"); }
-            if val.contains("zh") { return ("zh-CN", "ltr"); }
-            if val.contains("vi") { return ("vi", "ltr"); }
-        }
-    }
-    ("en", "ltr")
-}
-
 fn render_password_form(req: &HttpRequest, file_name: &str, token: &str, error: Option<&str>) -> HttpResponse {
     let (lang, dir) = resolve_req_lang(req);
     let safe_file_name = escape_html(file_name);
@@ -278,29 +254,48 @@ async fn get_shared_file(
     if row.revoked {
         return HttpResponse::NotFound().body("This shared link has been revoked");
     }
-    
+
     if let Some(expiry) = row.expires_at {
         let now = chrono::Utc::now().timestamp();
         if expiry < now {
             return HttpResponse::Gone().body("This shared link has expired");
         }
     }
-    
+
+    // A message can be encrypted in place *after* a share for it was
+    // created — re-check on every request, not just at creation time.
+    // Fails closed with the same response as "token not found" so an
+    // anonymous holder can't distinguish "revoked" from "now encrypted".
+    if crate::folder_share_routes::is_encrypted_message(&db_conn, row.folder_id, row.message_id) {
+        return HttpResponse::NotFound().body("Shared link not found");
+    }
+
     // Check password protection
     if let Some(hash) = &row.password_hash {
         let mut authenticated = false;
         if let Some(cookie) = req.cookie(&format!("share_auth_{}", token)) {
-            let expected = generate_cookie_val(&token, hash);
-            if cookie.value() == expected {
+            if verify_cookie_val(cookie.value(), &token, hash, 30 * 60) {
                 authenticated = true;
             }
         }
-        
+
         if !authenticated {
             return render_password_form(&req, &row.file_name, &token, None);
         }
     }
-    
+
+    // Atomic check-and-increment: enforces usage_limit at the database level
+    // so two near-simultaneous requests against a `usage_limit = 1` link
+    // can't both slip through (see `try_increment_share_usage`).
+    match try_increment_share_usage(&db_conn, &token) {
+        Ok(true) => {}
+        Ok(false) => return HttpResponse::Gone().body("This shared link has reached its download limit"),
+        Err(e) => {
+            log::error!("DB error incrementing usage for token {}: {}", token, e);
+            return HttpResponse::InternalServerError().body("Internal server error");
+        }
+    }
+
     // Retrieve and stream the file from Telegram
     let client_opt = { tg_state.client.lock().await.clone() };
     let client = match client_opt {
@@ -350,9 +345,14 @@ async fn verify_shared_file_password(
     path: web::Path<String>,
     form: web::Form<VerifyForm>,
     db_conn: web::Data<DbConnection>,
+    rate_limiter: web::Data<Arc<VerifyRateLimiter>>,
 ) -> impl Responder {
     let token = path.into_inner();
-    
+
+    if !rate_limiter.check_and_record(&token) {
+        return HttpResponse::TooManyRequests().body("Too many attempts. Please try again later.");
+    }
+
     let row = match get_share_by_token(&db_conn, &token) {
         Ok(Some(r)) => r,
         Ok(None) => return HttpResponse::NotFound().body("Shared link not found"),
@@ -377,7 +377,7 @@ async fn verify_shared_file_password(
         // so the cookie cannot use `.secure(true)` without becoming unusable.
         // The cookie is protected by `.http_only(true)` and `.same_site(Strict)`
         // to mitigate XSS and CSRF within the constraints of a local-network HTTP service.
-        let val = generate_cookie_val(&token, hash);
+        let val = generate_cookie_val(&token, hash, chrono::Utc::now().timestamp());
         let cookie = Cookie::build(format!("share_auth_{}", token), val)
             .path(format!("/d/{}", token))
             .http_only(true)
@@ -401,7 +401,7 @@ pub fn configure_share_routes(cfg: &mut web::ServiceConfig) {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_req_lang;
+    use crate::share_common::resolve_req_lang;
     use actix_web::test::TestRequest;
 
     #[test]

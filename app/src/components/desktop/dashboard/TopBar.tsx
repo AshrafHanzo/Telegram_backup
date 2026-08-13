@@ -26,6 +26,7 @@ import { useTheme } from '../../../context/ThemeContext';
 import { useSettings } from '../../../context/SettingsContext';
 import { Button, IconButton, MenuItem, MenuPanel, SearchField } from '../../ui';
 import type { SortDirection, SortField } from './FileExplorer';
+import { NotificationBell } from './NotificationBell';
 
 interface TopBarProps {
     currentFolderName: string;
@@ -184,6 +185,8 @@ export function TopBar({
                         >
                             {t('common.upload')}
                         </Button>
+
+                        <NotificationBell />
 
                         <div className="relative" ref={viewRef}>
                             <IconButton

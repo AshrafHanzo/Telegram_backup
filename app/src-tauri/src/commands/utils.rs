@@ -74,6 +74,23 @@ pub fn cmd_get_bandwidth(bw_state: State<'_, Arc<BandwidthManager>>) -> crate::b
     bw_state.get_stats()
 }
 
+/// Sets the configurable daily transfer cap. `gigabytes: None` means
+/// unlimited; otherwise it's converted to bytes and enforced from the next
+/// transfer onward — already-reserved bandwidth for today is unaffected.
+#[tauri::command]
+pub fn cmd_set_bandwidth_limit(
+    gigabytes: Option<f64>,
+    bw_state: State<'_, Arc<BandwidthManager>>,
+) -> Result<crate::bandwidth::BandwidthStats, String> {
+    let bytes = match gigabytes {
+        None => u64::MAX,
+        Some(gb) if gb > 0.0 && gb.is_finite() => (gb * 1024.0 * 1024.0 * 1024.0) as u64,
+        Some(_) => return Err("Storage cap must be a positive number of GB".to_string()),
+    };
+    bw_state.set_limit(bytes);
+    Ok(bw_state.get_stats())
+}
+
 pub fn map_error(e: impl std::fmt::Display) -> String {
     let err_str = e.to_string();
     if err_str.contains("FLOOD_WAIT") {

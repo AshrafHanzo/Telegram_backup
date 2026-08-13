@@ -61,6 +61,14 @@ pub mod api_routes;
 pub mod webdav;
 pub mod db;
 pub mod share_routes;
+pub mod share_common;
+pub mod share_permissions;
+pub mod folder_share_routes;
+pub mod google_auth;
+pub mod audit_sync;
+pub mod remote_catalog;
+pub mod tunnel;
+pub mod relay;
 pub mod upload_service;
 pub mod jni_cache;
 pub mod transcode;
@@ -596,6 +604,30 @@ pub fn run() {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let builder = builder.plugin(tauri_plugin_window_state::Builder::default().build());
 
+    // "--minimized" is what the OS passes back when it launches us at
+    // login (see the tray-icon setup below, which checks for it) — without
+    // this the app would pop a visible window every time the user logs into
+    // Windows, defeating the point of running quietly in the background.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let builder = builder.plugin(tauri_plugin_autostart::init(
+        tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+        Some(vec!["--minimized"]),
+    ));
+
+    // Closing the window hides it instead of quitting — the scheduled
+    // backup and the streaming/WebDAV/API servers all keep running in the
+    // background. Only the tray menu's "Quit" (see setup() below) actually
+    // exits the process.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let builder = builder.on_window_event(|window, event| {
+        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+            if window.label() == "main" {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        }
+    });
+
     let app = builder
         .setup(move |app| {
             #[cfg(target_os = "android")]
@@ -684,6 +716,7 @@ pub fn run() {
                 runner_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
                 peer_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
                 cancelled_transfers: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
+                remote_jobs_checked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             });
             app.manage(Arc::new(bandwidth::BandwidthManager::new(app.handle())));
             app.manage(StreamConfig { token: stream_token.clone(), port: STREAM_PORT });
@@ -763,6 +796,16 @@ pub fn run() {
             })?;
             app.manage(db_pool.clone());
             
+            // Best-effort public tunnel for Temp Links — see tunnel.rs for why
+            // this is skipped on Android (no equivalent local server there
+            // either; folder_share_routes/share_routes are desktop-only).
+            #[cfg(not(target_os = "android"))]
+            {
+                let tunnel_state = Arc::new(tunnel::TunnelState::new());
+                app.manage(tunnel_state.clone());
+                tunnel::start(app.handle().clone(), STREAM_PORT, tunnel_state);
+            }
+
             // Start Streaming Server on dedicated thread (Actix needs its own runtime)
             // Disabled on Android: actix_rt::System creates a second Tokio runtime that
             // conflicts with Tauri's runtime and crashes the process on launch.
@@ -773,12 +816,14 @@ pub fn run() {
                 let handle_for_thread = server_handle_for_setup.clone();
                 let db_pool_for_server = db_pool.clone();
                 let transcode_for_server = transcode_arc.clone();
+                let bw_for_server = app.state::<Arc<bandwidth::BandwidthManager>>().inner().clone();
+                let net_for_server = net_config.clone();
                 std::thread::spawn(move || {
                     #[cfg(target_os = "windows")]
                     init_com_on_worker_thread();
                     let sys = actix_rt::System::new();
                     sys.block_on(async move {
-                        match server::start_server(state, STREAM_PORT, token_for_server, db_pool_for_server, transcode_for_server).await {
+                        match server::start_server(state, STREAM_PORT, token_for_server, db_pool_for_server, transcode_for_server, bw_for_server, net_for_server).await {
                             Ok(server) => {
                                 if let Ok(mut handle) = handle_for_thread.lock() {
                                     *handle = Some(server.handle());
@@ -801,6 +846,32 @@ pub fn run() {
 
             // Start WebDAV server if enabled in settings.
             restart_webdav_server(app.handle());
+
+            // Backup feature: managed run-guard/progress state, then start
+            // (or catch up on) the daily scheduler from persisted settings.
+            app.manage(commands::backup::BackupState::new());
+            commands::backup::restart_backup_scheduler(app.handle());
+
+            // Google Sign-In: tracks the in-flight loopback OAuth attempt
+            // (if any). Google/Drive access is entirely independent of
+            // Telegram login — nothing here touches TelegramState.
+            app.manage(google_auth::GoogleOAuthState::new());
+
+            // App lock: pending-OTP store + rate limiters. Also independent
+            // of TelegramState — this gates the *app*, not the Telegram
+            // account.
+            app.manage(commands::app_lock::AppLockOtpState::new());
+
+            // Authenticator (TOTP): pending-setup-secret store + rate
+            // limiters. Independent of TelegramState — it wraps the
+            // session file as an opaque blob rather than touching the
+            // grammers client itself.
+            app.manage(commands::totp::TotpSetupState::new());
+
+            // Vault unlock: its own rate-limiter bucket, distinct from App
+            // Lock's and TOTP's, so brute-force guessing against the vault
+            // passphrase is throttled without sharing state with either.
+            app.manage(crypto_commands::VaultUnlockRateLimiter::new());
 
             // Start VPN keep-alive background task
             // Disabled on Android: unnecessary on mobile and spawn_blocking may
@@ -836,6 +907,65 @@ pub fn run() {
                 });
             }
 
+            // Tray icon + "launch at startup, keep running when closed" so
+            // scheduled backups actually fire even if the user never opens
+            // the app that day — previously nothing ran at all unless the
+            // window was open. Closing the window now hides it instead of
+            // exiting; only the tray's own "Quit" really ends the process.
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            {
+                use tauri::menu::{Menu, MenuItem};
+                use tauri::tray::TrayIconBuilder;
+
+                let show_item = MenuItem::with_id(app, "show", "Open Telegram Drive", true, None::<&str>)?;
+                let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+                let tray_menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+
+                let mut tray_builder = TrayIconBuilder::new().menu(&tray_menu);
+                if let Some(icon) = app.default_window_icon() {
+                    tray_builder = tray_builder.icon(icon.clone());
+                }
+                tray_builder
+                    .show_menu_on_left_click(false)
+                    .tooltip("Telegram Drive")
+                    .on_menu_event(|app, event| match event.id.as_ref() {
+                        "show" => {
+                            if let Some(window) = app.get_webview_window("main") {
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                            }
+                        }
+                        "quit" => app.exit(0),
+                        _ => {}
+                    })
+                    .on_tray_icon_event(|tray, event| {
+                        if let tauri::tray::TrayIconEvent::Click {
+                            button: tauri::tray::MouseButton::Left,
+                            button_state: tauri::tray::MouseButtonState::Up,
+                            ..
+                        } = event
+                        {
+                            let app = tray.app_handle();
+                            if let Some(window) = app.get_webview_window("main") {
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                            }
+                        }
+                    })
+                    .build(app)?;
+
+                // Launched by Windows/macOS/Linux autostart (see the
+                // `--minimized` arg passed to the autostart plugin below)?
+                // Stay hidden in the tray instead of popping a window the
+                // user didn't ask to see right after login.
+                let launched_minimized = std::env::args().any(|arg| arg == "--minimized");
+                if let Some(window) = app.get_webview_window("main") {
+                    if !launched_minimized {
+                        let _ = window.show();
+                    }
+                }
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -860,6 +990,7 @@ pub fn run() {
             commands::cmd_rename_folder,
             commands::cmd_rename_file,
             commands::cmd_get_bandwidth,
+            commands::cmd_set_bandwidth_limit,
             commands::cmd_delete_preview_for_message,
             commands::cmd_get_preview,
             commands::cmd_clean_preview_cache,
@@ -894,6 +1025,64 @@ pub fn run() {
             commands::cmd_create_share,
             commands::cmd_list_shares,
             commands::cmd_revoke_share,
+            commands::cmd_create_folder_share,
+            commands::cmd_list_folder_shares,
+            commands::cmd_revoke_folder_share,
+            commands::cmd_get_share_tunnel_status,
+            commands::relay::cmd_get_relay_status,
+            commands::relay::cmd_set_relay_bot_token,
+            commands::relay::cmd_set_relay_worker_config,
+            commands::relay::cmd_prepare_folder_for_relay,
+            commands::backup::cmd_get_backup_settings,
+            commands::backup::cmd_add_backup_source,
+            commands::backup::cmd_remove_backup_source,
+            commands::backup::cmd_set_backup_source_enabled,
+            commands::backup::cmd_update_backup_schedule,
+            commands::backup::cmd_backup_now,
+            commands::backup::cmd_cancel_backup,
+            commands::backup::cmd_restore_backup,
+            commands::backup::cmd_get_backup_status,
+            commands::backup::cmd_set_backup_exclusions,
+            commands::backup::cmd_list_local_dir_entries,
+            commands::backup::cmd_get_standard_folders,
+            commands::backup::cmd_calculate_backup_all,
+            commands::notifications::cmd_list_notifications,
+            commands::notifications::cmd_mark_notification_read,
+            commands::notifications::cmd_mark_all_notifications_read,
+            commands::notifications::cmd_delete_notification,
+            commands::notifications::cmd_delete_all_notifications,
+            commands::notifications::cmd_list_audit_logs,
+            commands::notifications::cmd_delete_audit_log,
+            commands::notifications::cmd_delete_all_audit_logs,
+            audit_sync::cmd_sync_audit_log_to_telegram,
+            audit_sync::cmd_restore_audit_log_from_telegram,
+            commands::notifications::cmd_respond_to_notification,
+            commands::google_auth::cmd_set_google_oauth_client,
+            commands::google_auth::cmd_google_oauth_start,
+            commands::google_auth::cmd_google_oauth_poll,
+            commands::google_auth::cmd_google_oauth_cancel,
+            commands::google_auth::cmd_get_google_account,
+            commands::google_auth::cmd_google_sign_out,
+            commands::google_auth::cmd_google_drive_sync_pull,
+            commands::google_auth::cmd_google_drive_sync_push,
+            commands::smtp_settings::cmd_get_smtp_settings,
+            commands::smtp_settings::cmd_update_smtp_settings,
+            commands::app_lock::cmd_get_app_lock_status,
+            commands::app_lock::cmd_set_app_lock_enabled,
+            commands::app_lock::cmd_verify_app_lock_password,
+            commands::app_lock::cmd_send_app_lock_otp,
+            commands::app_lock::cmd_verify_otp_and_set_app_lock,
+            commands::totp::cmd_totp_status,
+            commands::totp::cmd_totp_setup_start,
+            commands::totp::cmd_totp_setup_confirm,
+            commands::totp::cmd_totp_resync_session,
+            commands::totp::cmd_totp_verify_and_restore_session,
+            commands::totp::cmd_totp_link_new_device,
+            commands::totp::cmd_totp_disable,
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            commands::autostart::cmd_get_autostart_enabled,
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            commands::autostart::cmd_set_autostart_enabled,
             commands::cmd_toggle_folder_visibility,
             commands::cmd_export_folder_invite,
             cmd_get_pending_share_count,

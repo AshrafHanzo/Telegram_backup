@@ -22,8 +22,22 @@ export function useFileDownload(store: Store | null) {
     const [downloadQueue, setDownloadQueue] = useState<DownloadItem[]>([]);
     const [initialized, setInitialized] = useState(false);
     const cancelledRef = useRef<Set<string>>(new Set());
+    // Tracks cancel requests that have been sent to the backend but not yet
+    // acknowledged, keyed by transfer id. Lets `retryItem` wait for a cancel
+    // to actually land before re-queuing the same id, so a fast Cancel then
+    // Retry can't result in two concurrent backend transfers sharing one id.
+    const cancellingRef = useRef<Map<string, Promise<void>>>(new Map());
     const activeCountRef = useRef(0);
     const { settings } = useSettings();
+
+    const requestCancel = (id: string): Promise<void> => {
+        cancelledRef.current.add(id);
+        const cancelPromise = invoke('cmd_cancel_transfer', { transferId: id })
+            .catch(() => {})
+            .finally(() => { cancellingRef.current.delete(id); }) as Promise<void>;
+        cancellingRef.current.set(id, cancelPromise);
+        return cancelPromise;
+    };
 
     // Listen for progress events from Rust
     useEffect(() => {
@@ -136,8 +150,10 @@ export function useFileDownload(store: Store | null) {
                         { errorTitle: 'Save dialog failed' },
                     );
                     if (!savePath) {
+                        // Note: no manual `activeCountRef.current--` here — the
+                        // `finally` block below already decrements on every exit
+                        // path, including this early return.
                         setDownloadQueue(q => q.filter(i => i.id !== item.id));
-                        activeCountRef.current--;
                         return;
                     }
                 }
@@ -253,10 +269,9 @@ export function useFileDownload(store: Store | null) {
 
     const cancelAll = () => {
         setDownloadQueue(q => {
-            const downloading = q.find(i => i.status === 'downloading');
-            if (downloading) {
-                cancelledRef.current.add(downloading.id);
-                invoke('cmd_cancel_transfer', { transferId: downloading.id }).catch(() => {});
+            const downloadingItems = q.filter(i => i.status === 'downloading');
+            for (const item of downloadingItems) {
+                requestCancel(item.id);
             }
             return q
                 .filter(i => i.status !== 'pending')
@@ -269,8 +284,7 @@ export function useFileDownload(store: Store | null) {
         setDownloadQueue(q => {
             const item = q.find(i => i.id === id);
             if (item?.status === 'downloading') {
-                cancelledRef.current.add(id);
-                invoke('cmd_cancel_transfer', { transferId: id }).catch(() => {});
+                requestCancel(id);
                 return q.map(i => i.id === id ? { ...i, status: 'cancelled' as const } : i);
             }
             if (item?.status === 'pending') {
@@ -280,7 +294,13 @@ export function useFileDownload(store: Store | null) {
         });
     };
 
-    const retryItem = (id: string) => {
+    const retryItem = async (id: string) => {
+        // If a cancel for this id was just requested, wait for the backend to
+        // acknowledge it before re-queuing — otherwise the retried transfer
+        // could start under the same id while the old one is still winding down.
+        const pendingCancel = cancellingRef.current.get(id);
+        if (pendingCancel) await pendingCancel;
+
         setDownloadQueue(q => q.map(i =>
             i.id === id && (i.status === 'error' || i.status === 'cancelled' || i.status === 'waiting_for_unlock')
                 ? { ...i, status: 'pending' as const, error: undefined, progress: undefined, downloadedBytes: undefined, totalBytes: undefined, speedBytesPerSec: undefined }

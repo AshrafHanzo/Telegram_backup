@@ -12,6 +12,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use grammers_tl_types as tl;
 
 use crate::TelegramState;
+use crate::db::DbConnection;
 use crate::models::{AuthResult};
 use crate::commands::utils::map_error;
 use grammers_client::SignInError;
@@ -79,12 +80,18 @@ pub async fn ensure_client_initialized(
     
     let mut session_open_result = SqliteSession::open(&session_path_str);
     
-    // Retry opening the session database up to 5 times (every 100ms)
-    // in case the database is temporarily locked by the old shutting down runner.
+    // Retry opening the session database for a few seconds in case it's
+    // temporarily locked by the old shutting-down runner OR by something
+    // outside this app entirely — OneDrive/antivirus routinely hold a lock
+    // on files under %APPDATA% for longer than a few hundred ms while
+    // syncing/scanning. Anything still failing after this budget falls
+    // through to wiping and recreating the session below, which forces a
+    // full re-login — so this budget is deliberately generous to avoid
+    // destroying a perfectly good session over an ordinary transient lock.
     if session_open_result.is_err() {
-        for attempt in 1..=5 {
-            log::warn!("Failed to open session on attempt {} (database may be locked). Retrying in 100ms...", attempt);
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        for attempt in 1..=20 {
+            log::warn!("Failed to open session on attempt {} (database may be locked). Retrying in 250ms...", attempt);
+            tokio::time::sleep(Duration::from_millis(250)).await;
             session_open_result = SqliteSession::open(&session_path_str);
             if session_open_result.is_ok() {
                 break;
@@ -151,6 +158,30 @@ pub async fn ensure_client_initialized(
     });
     
     *client_guard = Some(client.clone());
+    drop(client_guard);
+
+    // One-shot: the first time any path establishes a connected client this
+    // launch, check for pending remote jobs from the mobile app exactly
+    // once — never a poll loop. See remote_catalog.rs's module doc.
+    if !state.remote_jobs_checked.swap(true, Ordering::SeqCst) {
+        let app_for_task = app_handle.clone();
+        let client_for_task = client.clone();
+        let peer_cache = state.peer_cache.clone();
+        tauri::async_runtime::spawn(async move {
+            let db_pool = app_for_task.state::<DbConnection>();
+            if let Err(error) = crate::remote_catalog::process_pending_jobs_once(
+                &app_for_task,
+                &client_for_task,
+                &db_pool,
+                &peer_cache,
+            )
+            .await
+            {
+                log::warn!("Remote job check failed (non-fatal): {}", error);
+            }
+        });
+    }
+
     Ok(client)
 }
 
