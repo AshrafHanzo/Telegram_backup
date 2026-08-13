@@ -1,3 +1,26 @@
+## [2.3.0] - 2026-08-13
+
+### Mobile App
+
+- Added a companion Expo/React Native mobile app (Telegram login, folders/files, search, sharing, backup/restore, remote backup, encryption vault viewer, App Lock, Google Drive-based settings sync).
+- Redesigned the mobile UI with a dark theme, illustrated empty states, top-tab navigation, and proper safe-area handling.
+
+### Cross-Platform Sync & Security Fixes
+
+- Fixed a Google Drive sync data-loss bug where a desktop-side push could silently erase fields (like mobile's share links) it didn't recognize.
+- Fixed Drive-sync credentials/App Lock requiring a manual "Sync now" instead of applying automatically at login, on both platforms.
+- Added brute-force rate limiting to vault unlock (desktop and mobile), matching the existing App Lock/TOTP protection.
+- Switched password/OTP comparisons to constant-time checks; vault key material is now zeroed from memory on lock.
+- Fixed a share-link usage-limit race that could let a single-use link be used more than once under concurrent requests.
+- Fixed a bandwidth-quota leak on cancelled uploads.
+- Fixed the desktop download queue's "Cancel All" only cancelling one transfer while marking all of them cancelled in the UI, and a related active-transfer counter double-decrement.
+- Fixed backup/restore operations marking a transfer successful without verifying the transferred size, and a related upload-completion correlation bug that could cross-wire concurrent same-named uploads.
+
+### Updater
+
+- Fixed the in-app update banner silently failing with no visible error on a signature mismatch.
+- Regenerated the updater signing keypair and pointed the update channel at this repository's own releases.
+
 ## [2.2.7] - 2026-08-04
 
 ### Windows Build Experience
