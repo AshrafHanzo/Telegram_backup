@@ -1,6 +1,8 @@
 import { useState, useEffect, useCallback } from 'react';
 import { check, Update } from '@tauri-apps/plugin-updater';
 import { relaunch } from '@tauri-apps/plugin-process';
+import { toast } from 'sonner';
+import { useTranslation } from 'react-i18next';
 
 interface UpdateState {
     checking: boolean;
@@ -12,6 +14,7 @@ interface UpdateState {
 }
 
 export function useUpdateCheck() {
+    const { t } = useTranslation();
     const [state, setState] = useState<UpdateState>({
         checking: false,
         available: false,
@@ -38,14 +41,20 @@ export function useUpdateCheck() {
                 setState(s => ({ ...s, checking: false, available: false }));
             }
         } catch (err: unknown) {
-            const message = err instanceof Error ? err.message : 'Failed to check for updates';
+            const message = err instanceof Error ? err.message : String(err);
             setState(s => ({
                 ...s,
                 checking: false,
                 error: message,
             }));
+            // Silent update checks (this hook's own 5s-after-launch check) stay
+            // quiet on failure — only surface a toast for the dev-build case,
+            // matching SettingsModal's explicit "Check for updates" button.
+            if (message.includes('dev') || message.includes('no current version')) {
+                toast.info(t('settings.update_prod_only_toast'));
+            }
         }
-    }, []);
+    }, [t]);
 
     const downloadAndInstall = useCallback(async () => {
         if (!update) return;
@@ -71,14 +80,18 @@ export function useUpdateCheck() {
 
             await relaunch();
         } catch (err: unknown) {
-            const message = err instanceof Error ? err.message : 'Failed to install update';
+            const message = err instanceof Error ? err.message : String(err);
             setState(s => ({
                 ...s,
                 downloading: false,
                 error: message,
             }));
+            // Without this, the banner just silently reverts to "Update Now"
+            // with no indication anything went wrong — see SettingsModal's
+            // handleInstallUpdate for the same toast on the same failure.
+            toast.error(t('settings.update_failed_toast', { error: message }));
         }
-    }, [update]);
+    }, [update, t]);
 
     const dismissUpdate = useCallback(() => {
         setState(s => ({ ...s, available: false }));

@@ -6,9 +6,9 @@
     },
     "updater": {
       "endpoints": [
-        "https://github.com/caamer20/Telegram-Drive/releases/latest/download/latest.json"
+        "https://github.com/MageshwarSV/Telegram-drive/releases/latest/download/latest.json"
       ],
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDdDOEI1OTZCRUI5RDlBNzgKUldSNG1wM3JhMW1MZkN4L2oyV2ZUcXRLRzVDZnJOb3VSRDFlTXlYc1ZwRUtRRW1NTlNNR25NQkwK"
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEJCRDMyMUFGRURFQ0U1RTYKUldUbTVlenRyeUhUdTkwUmg3MW1ySHV6bG8rMXhySUpNUGZNWlM2RUY0UTRzQUtwT1NpOEE1cUMK"
     }
   },
   "productName": "Telegram Drive",
