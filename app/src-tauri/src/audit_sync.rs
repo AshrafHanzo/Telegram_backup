@@ -24,7 +24,7 @@ use tokio::sync::RwLock;
 
 type PeerCache = Arc<RwLock<HashMap<i64, Peer>>>;
 
-const AUDIT_LOG_MARKER: &str = "[TD-AUDIT-LOG]";
+pub(crate) const AUDIT_LOG_MARKER: &str = "[TD-AUDIT-LOG]";
 const RETENTION_DAYS: i64 = 30;
 const SCAN_LIMIT: usize = 300;
 

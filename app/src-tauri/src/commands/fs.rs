@@ -7,6 +7,8 @@ use crate::TelegramState;
 use crate::models::{FolderMetadata, FileMetadata};
 use crate::bandwidth::{BandwidthManager, BandwidthReservation};
 use crate::commands::utils::{media_size, resolve_peer, map_error};
+use crate::audit_sync::AUDIT_LOG_MARKER;
+use crate::remote_catalog::{CATALOG_MARKER, JOBS_MARKER};
 use crate::vpn_optimizer::{NetworkConfig, backoff_ms};
 use crate::db::DbConnection;
 use crate::crypto::envelope::encrypt_reader::{EncryptingReader, EncryptionSession};
@@ -2808,6 +2810,16 @@ pub async fn cmd_get_files(
         }
         last_msg_id = Some(current_msg_id);
 
+        // Internal sync snapshots (audit log, backup catalog, remote job
+        // queue) are tagged with a reserved caption and sent as real
+        // Telegram documents so they survive a reinstall/lost device — but
+        // they're bookkeeping, not user files, so they must never show up
+        // in the file list itself.
+        let caption = msg.text();
+        if caption == AUDIT_LOG_MARKER || caption == CATALOG_MARKER || caption == JOBS_MARKER {
+            continue;
+        }
+
         if let Some(doc) = msg.media() {
             let declared_size = media_size(&doc);
             let (mut name, mut size, mut mime, mut ext, remote_document_name) = match doc {
@@ -2973,6 +2985,9 @@ fn extract_search_files(msgs: &[tl::enums::Message]) -> Vec<FileMetadata> {
     let mut files = Vec::new();
     for msg in msgs {
         if let tl::enums::Message::Message(m) = msg {
+            if m.message == AUDIT_LOG_MARKER || m.message == CATALOG_MARKER || m.message == JOBS_MARKER {
+                continue;
+            }
             if let Some(tl::enums::MessageMedia::Document(d)) = &m.media {
                 if let Some(tl::enums::Document::Document(doc)) = &d.document {
                     let doc_name = doc.attributes.iter().find_map(|a| match a {

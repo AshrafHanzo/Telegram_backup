@@ -34,8 +34,8 @@ use tokio::sync::RwLock;
 
 type PeerCache = Arc<RwLock<HashMap<i64, Peer>>>;
 
-const CATALOG_MARKER: &str = "[TD-CATALOG]";
-const JOBS_MARKER: &str = "[TD-REMOTE-JOBS]";
+pub(crate) const CATALOG_MARKER: &str = "[TD-CATALOG]";
+pub(crate) const JOBS_MARKER: &str = "[TD-REMOTE-JOBS]";
 const SCAN_LIMIT: usize = 300;
 const MAX_ENTRIES_PER_SOURCE: usize = 2000;
 const COVER_MAX_DIMENSION: u32 = 48;

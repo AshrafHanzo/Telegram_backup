@@ -1,3 +1,9 @@
+## [2.3.1] - 2026-08-13
+
+### Fixes
+
+- Fixed the audit log, backup catalog, and remote job queue's internal Telegram sync snapshots (`audit-log.json`, `backup-catalog.json`, `remote-jobs.json`) showing up as regular visible files in Saved Messages and in global search — they're bookkeeping the app itself reads, not user files, and are now filtered out of both.
+
 ## [2.3.0] - 2026-08-13
 
 ### Mobile App
