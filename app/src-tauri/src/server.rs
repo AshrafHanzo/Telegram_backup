@@ -41,6 +41,41 @@ pub fn parse_range_header(header_val: &str, total_size: u64) -> Option<(u64, u64
     }
 }
 
+/// Builds a `Content-Disposition` value that reliably triggers a download
+/// (rather than the browser rendering the file inline) for any filename,
+/// including non-ASCII ones.
+///
+/// Per RFC 6266 the plain `filename` parameter carries an ASCII-only
+/// fallback and `filename*` the exact UTF-8 name. The fallback has to be
+/// sanitized rather than passed through: a raw non-ASCII byte or a bare
+/// quote makes the header value invalid, which ends up either mangling the
+/// saved name or dropping the header entirely — and a dropped header is
+/// exactly what makes an image or PDF open in a tab instead of downloading.
+pub fn content_disposition_attachment(filename: &str) -> String {
+    let ascii_fallback: String = filename
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric()
+                || matches!(character, '.' | '-' | '_' | ' ' | '(' | ')' | '[' | ']')
+            {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let ascii_fallback = if ascii_fallback.trim_matches(|c| c == '_' || c == ' ').is_empty() {
+        "download".to_string()
+    } else {
+        ascii_fallback
+    };
+    format!(
+        "attachment; filename=\"{}\"; filename*=UTF-8''{}",
+        ascii_fallback,
+        urlencoding::encode(filename)
+    )
+}
+
 /// Extra headers to inject into streaming responses (e.g. Cache-Control, Content-Disposition).
 pub struct StreamingExtras {
     pub extra_headers: Vec<(&'static str, String)>,
@@ -198,10 +233,7 @@ pub fn build_media_response(
     resp.insert_header(("Accept-Ranges", "bytes"));
 
     if let Some(fname) = filename {
-        resp.insert_header((
-            "Content-Disposition",
-            format!("attachment; filename=\"{}\"", fname),
-        ));
+        resp.insert_header(("Content-Disposition", content_disposition_attachment(fname)));
     }
 
     for (key, val) in &extras.extra_headers {
@@ -416,4 +448,49 @@ pub async fn start_server(
     log::info!("Streaming Server started successfully on port {}", port);
 
     Ok(server)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attachment_disposition_always_forces_a_download() {
+        // The `attachment` disposition is the whole point: without it a
+        // browser renders an image/PDF/video inline instead of saving it.
+        let value = content_disposition_attachment("photo.jpg");
+        assert!(value.starts_with("attachment;"));
+        assert!(value.contains("filename=\"photo.jpg\""));
+    }
+
+    #[test]
+    fn non_ascii_name_stays_header_safe_but_is_preserved_in_filename_star() {
+        let value = content_disposition_attachment("ஃபைல்.pdf");
+        // The plain fallback must be pure ASCII — a raw non-ASCII byte makes
+        // the whole header invalid, which is how the header ends up dropped.
+        let fallback = value
+            .split("filename=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("fallback filename present");
+        assert!(fallback.is_ascii(), "fallback was not ASCII: {}", fallback);
+        // ...while the exact name survives percent-encoded in `filename*`.
+        assert!(value.contains("filename*=UTF-8''"));
+        assert!(value.contains("%2Epdf") || value.contains(".pdf"));
+    }
+
+    #[test]
+    fn quotes_cannot_break_out_of_the_fallback_parameter() {
+        let value = content_disposition_attachment("evil\"name.txt");
+        let after = value.split("filename=\"").nth(1).unwrap();
+        let fallback = after.split('"').next().unwrap();
+        assert!(!fallback.contains('"'));
+        assert_eq!(fallback, "evil_name.txt");
+    }
+
+    #[test]
+    fn a_name_with_nothing_ascii_still_yields_a_usable_fallback() {
+        let value = content_disposition_attachment("日本語");
+        assert!(value.contains("filename=\"download\""));
+    }
 }

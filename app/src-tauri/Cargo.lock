@@ -459,6 +459,7 @@ dependencies = [
  "tauri-plugin-window-state",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "unrar",
  "urlencoding",
  "walkdir",

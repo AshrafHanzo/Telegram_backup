@@ -338,18 +338,18 @@ async fn folder_share_page(
             };
 
             let mut actions = format!(
-                r#"<a class="btn ghost" href="/s/{token}/files/{id}">Download</a>"#,
-                token = token, id = entry.message_id
+                r#"<a class="btn primary-soft" href="/s/{token}/files/{id}">{icon}Download</a>"#,
+                token = token, id = entry.message_id, icon = ICON_DOWNLOAD
             );
             if row.permissions.contains(SharePermissions::DELETE) {
                 actions.push_str(&format!(
-                    r#" <button class="btn danger" onclick="del({})">Delete</button>"#,
-                    entry.message_id
+                    r#"<button class="btn icon" onclick="del({id})" title="Delete" aria-label="Delete {name}">{icon}</button>"#,
+                    id = entry.message_id, name = name, icon = ICON_TRASH
                 ));
             }
 
             format!(
-                r#"<div class="file-card"><div class="file-thumb">{thumb}</div><div class="file-info"><div class="file-name" title="{name}"><bdi dir="auto">{name}</bdi></div><div class="file-size">{size}</div></div><div class="file-actions">{actions}</div></div>"#,
+                r#"<div class="file-card"><div class="file-thumb">{thumb}</div><div class="file-body"><div class="file-name" title="{name}"><bdi dir="auto">{name}</bdi></div><div class="file-size">{size}</div></div><div class="file-actions">{actions}</div></div>"#,
                 thumb = thumb_inner,
                 name = name,
                 size = format_bytes(entry.size as u64),
@@ -369,26 +369,33 @@ async fn folder_share_page(
     // plus an aggregate total/ETA/elapsed row `UploadQueue` doesn't need
     // (it shows separate per-file cards, not one combined upload).
     let upload_html = if row.permissions.contains(SharePermissions::UPLOAD) {
-        r##"<div id="uploadZone" class="upload-zone">
-            <input type="file" id="fileInput" multiple hidden>
-            <div class="upload-icon">&#8679;</div>
-            <p>Drag and drop files here, or <a href="#" id="browseLink">choose files</a> to upload</p>
-        </div>
-        <div id="uploadProgressCard" class="card upload-progress-card" style="display:none;">
-            <div class="upload-progress-header">
-                <div class="progress-summary-row">
-                    <strong id="overallPercent">0%</strong>
-                    <span id="overallStats">0 B / 0 B</span>
-                </div>
-                <div class="progress-bar-track"><div class="progress-bar-fill" id="overallBar"></div></div>
-                <div class="progress-meta-row">
-                    <span id="overallSpeed"></span>
-                    <span id="overallEta"></span>
-                    <span id="overallElapsed"></span>
-                </div>
+        format!(
+            r##"<section class="section">
+            <div class="section-label">Upload</div>
+            <div id="uploadZone" class="dropzone" role="button" tabindex="0" aria-label="Choose files to upload">
+                <input type="file" id="fileInput" multiple hidden>
+                <div class="dropzone-icon">{icon}</div>
+                <div class="dropzone-title">Drop files here, or <span id="browseLink">browse</span></div>
+                <div class="dropzone-sub">Uploaded straight to Telegram — large files are split automatically</div>
             </div>
-            <div class="file-progress-list" id="fileProgressList"></div>
-        </div>"##.to_string()
+            <div id="uploadProgressCard" class="progress-panel" style="display:none;">
+                <div class="progress-head">
+                    <div class="progress-top">
+                        <div class="progress-pct" id="overallPercent">0%</div>
+                        <div class="progress-bytes" id="overallStats">0 B / 0 B</div>
+                    </div>
+                    <div class="bar"><div class="bar-fill" id="overallBar"></div></div>
+                    <div class="stat-row">
+                        <div class="stat"><div class="stat-label">Speed</div><div class="stat-value" id="overallSpeed">&ndash;</div></div>
+                        <div class="stat"><div class="stat-label">Remaining</div><div class="stat-value" id="overallEta">&ndash;</div></div>
+                        <div class="stat"><div class="stat-label">Elapsed</div><div class="stat-value" id="overallElapsed">0s</div></div>
+                    </div>
+                </div>
+                <div class="progress-list" id="fileProgressList"></div>
+            </div>
+        </section>"##,
+            icon = ICON_UPLOAD
+        )
     } else {
         String::new()
     };
@@ -414,31 +421,76 @@ async fn folder_share_page(
     }
 
     let safe_folder_name = escape_html(&row.folder_name);
+
+    // Summary before detail: a link holder wants to know what's in here
+    // before scanning individual cards.
+    let total_bytes: u64 = entries.iter().map(|entry| entry.size.max(0) as u64).sum();
+    let meta_chips = if entries.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<div class="folder-meta"><span class="chip">{count} {label}</span><span class="chip">{total} total</span></div>"#,
+            count = entries.len(),
+            label = if entries.len() == 1 { "file" } else { "files" },
+            total = format_bytes(total_bytes),
+        )
+    };
+
+    let listing = if entries.is_empty() {
+        format!(
+            r#"<div class="empty"><div class="empty-icon">{icon}</div><div class="empty-title">Nothing here yet</div><div class="empty-sub">{sub}</div></div>"#,
+            icon = ICON_FOLDER,
+            sub = if row.permissions.contains(SharePermissions::UPLOAD) {
+                "Files added below will appear here."
+            } else {
+                "This folder is empty."
+            },
+        )
+    } else {
+        format!(
+            r#"<section class="section"><div class="section-label">Files</div><div class="file-grid">{}</div></section>"#,
+            cards_html
+        )
+    };
+
     let html = format!(
         r#"<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>{name} - Shared Folder - Telegram Drive</title>
+    <meta name="color-scheme" content="dark">
+    <title>{name} — Telegram Drive</title>
     <style>{style}</style>
 </head>
 <body>
-    <div class="wrap">
-        <h1>Shared folder: <bdi dir="auto">{name}</bdi></h1>
+    <header class="topbar">
+        <div class="topbar-inner">
+            <div class="brand">
+                <span class="brand-mark">{logo}</span>
+                <span class="brand-name">Telegram Drive</span>
+            </div>
+            <span class="badge">Shared folder</span>
+        </div>
+    </header>
+    <main class="wrap">
+        <div class="folder-head">
+            <div class="folder-eyebrow">Shared with you</div>
+            <h1 class="folder-name"><bdi dir="auto">{name}</bdi></h1>
+            {chips}
+        </div>
         {listing}
         {upload}
-    </div>
+        <div class="foot">Files are stored in Telegram and streamed on demand.</div>
+    </main>
     {script}
 </body>
 </html>"#,
         name = safe_folder_name,
         style = SHARE_PAGE_CSS,
-        listing = if entries.is_empty() {
-            r#"<div class="card"><div class="empty">No files to show.</div></div>"#.to_string()
-        } else {
-            format!(r#"<div class="file-grid">{}</div>"#, cards_html)
-        },
+        logo = ICON_SHIELD,
+        chips = meta_chips,
+        listing = listing,
         upload = upload_html,
         script = script,
     );
@@ -449,53 +501,262 @@ async fn folder_share_page(
 /// `src/theme/presets.ts`) — matched exactly so this server-rendered page
 /// looks like part of the same app instead of a generic fallback page.
 const SHARE_PAGE_CSS: &str = r#"
+    /* Palette anchored to the desktop app's own "Default Dark" preset
+       (src/theme/presets.ts) so a share link reads as the same product,
+       extended with the raised-surface / hairline / shadow tokens a flat
+       two-color set can't express. */
     :root {
-        --bg: #101114; --surface: #1b1c20; --primary: #2aabee; --secondary: #63a9ff;
-        --text: #f7f7f5; --subtext: #b2b3ba; --border: rgba(255,255,255,0.1); --hover: rgba(255,255,255,0.055);
+        --canvas: #101114;
+        --surface: #191a1f;
+        --surface-raised: #20222a;
+        --line: rgba(255,255,255,0.07);
+        --line-strong: rgba(255,255,255,0.14);
+        --accent: #2aabee;
+        --accent-hover: #48b9f2;
+        --accent-soft: rgba(42,171,238,0.12);
+        --text: #f5f6f7;
+        --text-2: #a8abb4;
+        --text-3: #71757f;
+        --ok: #3ddc84;
+        --danger: #ff6b6b;
+        --radius-lg: 16px;
+        --radius: 12px;
+        --radius-sm: 9px;
+        --shadow: 0 1px 2px rgba(0,0,0,0.4), 0 10px 30px -12px rgba(0,0,0,0.7);
     }
     * { box-sizing: border-box; }
-    body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; margin:0; padding:2rem 1.25rem; }
-    .wrap { max-width:640px; margin:0 auto; }
-    h1 { font-size:1.15rem; font-weight:600; margin:0 0 1.25rem; }
-    .card { background:var(--surface); border:1px solid var(--border); border-radius:0.75rem; overflow:hidden; margin-bottom:1rem; }
-    .file-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(150px, 1fr)); gap:0.85rem; margin-bottom:1rem; }
-    .file-card { background:var(--surface); border:1px solid var(--border); border-radius:0.75rem; overflow:hidden; display:flex; flex-direction:column; }
-    .file-thumb { position:relative; aspect-ratio:1.6/1; background:var(--hover); }
-    .file-thumb .file-icon { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:var(--subtext); }
-    .file-thumb .file-icon svg { width:2rem; height:2rem; }
-    .file-thumb img { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
-    .file-info { padding:0.6rem 0.7rem 0.25rem; min-width:0; }
-    .file-name { font-size:0.82rem; color:var(--text); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    .file-size { font-size:0.74rem; color:var(--subtext); margin-top:0.15rem; }
-    .file-actions { display:flex; gap:0.4rem; padding:0.55rem 0.7rem 0.7rem; }
-    .file-actions .btn { flex:1; justify-content:center; padding:0.35rem 0.5rem; font-size:0.76rem; }
-    .btn { display:inline-flex; align-items:center; gap:0.35rem; padding:0.4rem 0.85rem; border-radius:0.5rem; background:var(--primary); color:#fff; text-decoration:none; border:none; cursor:pointer; font-size:0.82rem; font-weight:500; }
-    .btn:hover { filter:brightness(1.08); }
-    .btn.danger { background:#e05c5c; }
-    .btn.ghost { background:transparent; border:1px solid var(--border); color:var(--subtext); }
-    .btn.ghost:hover { color:var(--text); border-color:var(--subtext); }
-    .empty { color:var(--subtext); padding:2rem 1rem; text-align:center; font-size:0.9rem; }
-    .upload-zone { border:2px dashed var(--border); border-radius:0.75rem; padding:1.75rem 1.25rem; text-align:center; transition:border-color .15s, background .15s; cursor:pointer; }
-    .upload-zone.dragging { border-color:var(--primary); background:rgba(42,171,238,0.08); }
-    .upload-icon { font-size:1.6rem; margin-bottom:0.5rem; opacity:.85; }
-    .upload-zone p { margin:0; color:var(--subtext); font-size:0.88rem; }
-    .upload-zone a { color:var(--primary); text-decoration:none; font-weight:500; }
-    .upload-progress-card { margin-top:1rem; }
-    .upload-progress-header { padding:0.85rem 1rem; border-bottom:1px solid var(--border); background:var(--hover); }
-    .progress-summary-row { display:flex; justify-content:space-between; align-items:baseline; margin-bottom:0.5rem; font-size:0.82rem; color:var(--subtext); }
-    .progress-summary-row strong { color:var(--text); font-size:0.95rem; }
-    .progress-meta-row { display:flex; gap:0.9rem; font-size:0.74rem; color:var(--subtext); margin-top:0.4rem; }
-    .progress-bar-track { width:100%; background:var(--border); height:6px; border-radius:999px; overflow:hidden; }
-    .progress-bar-track.small { height:4px; margin:0.3rem 0 0; }
-    .progress-bar-fill { height:100%; background:var(--primary); border-radius:999px; width:0%; transition:width .2s linear; }
-    .file-progress-list { max-height:220px; overflow-y:auto; padding:0.4rem; }
-    .file-progress-row { padding:0.55rem 0.6rem; border-radius:0.5rem; }
-    .file-progress-row:hover { background:var(--hover); }
-    .file-progress-top { display:flex; justify-content:space-between; gap:0.5rem; font-size:0.8rem; }
-    .file-progress-name { color:var(--text); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1; }
-    .file-progress-pct { color:var(--subtext); flex-shrink:0; }
-    .file-progress-pct.ok { color:#4ade80; }
-    .file-progress-pct.fail { color:#e05c5c; }
+    html { -webkit-text-size-adjust: 100%; }
+    body {
+        margin: 0;
+        min-height: 100vh;
+        background: var(--canvas);
+        color: var(--text);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        font-size: 15px;
+        line-height: 1.5;
+        -webkit-font-smoothing: antialiased;
+    }
+    /* Soft accent bloom behind the header for depth without a heavy hero. */
+    body::before {
+        content: "";
+        position: fixed;
+        inset: 0 0 auto 0;
+        height: 380px;
+        background: radial-gradient(ellipse 620px 220px at 50% -60px, rgba(42,171,238,0.13), transparent 70%);
+        pointer-events: none;
+        z-index: 0;
+    }
+
+    .topbar {
+        position: sticky;
+        top: 0;
+        z-index: 10;
+        background: rgba(16,17,20,0.82);
+        backdrop-filter: blur(14px);
+        -webkit-backdrop-filter: blur(14px);
+        border-bottom: 1px solid var(--line);
+    }
+    .topbar-inner {
+        max-width: 880px;
+        margin: 0 auto;
+        padding: 0.85rem 1.5rem;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 1rem;
+    }
+    .brand { display: flex; align-items: center; gap: 0.6rem; min-width: 0; }
+    .brand-mark {
+        width: 30px; height: 30px;
+        flex-shrink: 0;
+        border-radius: 9px;
+        background: linear-gradient(150deg, var(--accent), #1d8fd0);
+        display: flex; align-items: center; justify-content: center;
+        color: #fff;
+        box-shadow: 0 2px 10px -2px rgba(42,171,238,0.55);
+    }
+    .brand-mark svg { width: 17px; height: 17px; }
+    .brand-name { font-size: 0.95rem; font-weight: 600; letter-spacing: -0.01em; }
+    .badge {
+        flex-shrink: 0;
+        font-size: 0.68rem;
+        font-weight: 600;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+        color: var(--accent);
+        background: var(--accent-soft);
+        border: 1px solid rgba(42,171,238,0.22);
+        padding: 0.3rem 0.6rem;
+        border-radius: 999px;
+    }
+
+    .wrap { position: relative; z-index: 1; max-width: 880px; margin: 0 auto; padding: 2.25rem 1.5rem 4rem; }
+
+    .folder-head { margin-bottom: 2.25rem; }
+    .folder-eyebrow {
+        font-size: 0.7rem; font-weight: 600; letter-spacing: 0.1em;
+        text-transform: uppercase; color: var(--text-3); margin-bottom: 0.55rem;
+    }
+    .folder-name {
+        margin: 0;
+        font-size: 1.85rem;
+        line-height: 1.15;
+        font-weight: 650;
+        letter-spacing: -0.02em;
+        text-wrap: balance;
+        word-break: break-word;
+    }
+    .folder-meta { display: flex; flex-wrap: wrap; gap: 0.45rem; margin-top: 0.9rem; }
+    .chip {
+        font-size: 0.76rem;
+        color: var(--text-2);
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        padding: 0.28rem 0.7rem;
+        font-variant-numeric: tabular-nums;
+    }
+
+    .section { margin-bottom: 2.25rem; }
+    .section:last-child { margin-bottom: 0; }
+    .section-label {
+        font-size: 0.7rem; font-weight: 600; letter-spacing: 0.1em;
+        text-transform: uppercase; color: var(--text-3);
+        margin-bottom: 0.85rem;
+        display: flex; align-items: center; gap: 0.5rem;
+    }
+
+    .file-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(178px, 1fr)); gap: 0.9rem; }
+    .file-card {
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: var(--radius-lg);
+        overflow: hidden;
+        display: flex;
+        flex-direction: column;
+        box-shadow: var(--shadow);
+        transition: transform 0.18s ease, border-color 0.18s ease;
+    }
+    .file-card:hover { transform: translateY(-2px); border-color: var(--line-strong); }
+    .file-thumb {
+        position: relative;
+        aspect-ratio: 16 / 10;
+        background: linear-gradient(155deg, var(--surface-raised), #15161a);
+        border-bottom: 1px solid var(--line);
+    }
+    .file-thumb .file-icon { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--text-3); }
+    .file-thumb .file-icon svg { width: 30px; height: 30px; }
+    .file-thumb img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; display: block; }
+    .file-body { padding: 0.75rem 0.85rem 0; min-width: 0; }
+    .file-name { font-size: 0.85rem; font-weight: 500; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .file-size { font-size: 0.75rem; color: var(--text-3); margin-top: 0.2rem; font-variant-numeric: tabular-nums; }
+    .file-actions { display: flex; gap: 0.4rem; padding: 0.8rem 0.85rem 0.85rem; margin-top: auto; }
+
+    .btn {
+        display: inline-flex; align-items: center; justify-content: center; gap: 0.4rem;
+        font-family: inherit; font-size: 0.8rem; font-weight: 550;
+        padding: 0.45rem 0.8rem;
+        border-radius: var(--radius-sm);
+        border: 1px solid transparent;
+        background: var(--accent); color: #05202e;
+        text-decoration: none; cursor: pointer;
+        transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+        white-space: nowrap;
+    }
+    .btn svg { width: 14px; height: 14px; }
+    .btn:hover { background: var(--accent-hover); }
+    .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .btn.primary-soft { flex: 1; background: var(--accent-soft); color: var(--accent); border-color: rgba(42,171,238,0.25); }
+    .btn.primary-soft:hover { background: rgba(42,171,238,0.2); border-color: rgba(42,171,238,0.45); }
+    .btn.icon { padding: 0.45rem; background: transparent; border-color: var(--line); color: var(--text-3); }
+    .btn.icon:hover { color: var(--danger); border-color: rgba(255,107,107,0.4); background: rgba(255,107,107,0.08); }
+
+    .empty {
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: var(--radius-lg);
+        padding: 3rem 1.5rem;
+        text-align: center;
+    }
+    .empty-icon {
+        width: 46px; height: 46px; margin: 0 auto 0.9rem;
+        border-radius: 50%;
+        background: var(--surface-raised);
+        border: 1px solid var(--line);
+        display: flex; align-items: center; justify-content: center;
+        color: var(--text-3);
+    }
+    .empty-icon svg { width: 21px; height: 21px; }
+    .empty-title { font-size: 0.92rem; font-weight: 550; }
+    .empty-sub { font-size: 0.8rem; color: var(--text-3); margin-top: 0.25rem; }
+
+    .dropzone {
+        border: 1.5px dashed var(--line-strong);
+        border-radius: var(--radius-lg);
+        background: rgba(255,255,255,0.012);
+        padding: 2.1rem 1.5rem;
+        text-align: center;
+        cursor: pointer;
+        transition: border-color 0.18s ease, background 0.18s ease;
+    }
+    .dropzone:hover { border-color: rgba(42,171,238,0.45); background: rgba(42,171,238,0.04); }
+    .dropzone.dragging { border-color: var(--accent); background: var(--accent-soft); }
+    .dropzone:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+    .dropzone-icon {
+        width: 44px; height: 44px; margin: 0 auto 0.85rem;
+        border-radius: 12px;
+        background: var(--accent-soft);
+        border: 1px solid rgba(42,171,238,0.22);
+        display: flex; align-items: center; justify-content: center;
+        color: var(--accent);
+    }
+    .dropzone-icon svg { width: 20px; height: 20px; }
+    .dropzone-title { font-size: 0.92rem; font-weight: 550; }
+    .dropzone-title span { color: var(--accent); }
+    .dropzone-sub { font-size: 0.78rem; color: var(--text-3); margin-top: 0.3rem; }
+
+    .progress-panel {
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: var(--radius-lg);
+        overflow: hidden;
+        box-shadow: var(--shadow);
+    }
+    .progress-head { padding: 1.1rem 1.15rem; border-bottom: 1px solid var(--line); }
+    .progress-top { display: flex; align-items: flex-end; justify-content: space-between; gap: 1rem; margin-bottom: 0.85rem; }
+    .progress-pct { font-size: 1.9rem; font-weight: 650; line-height: 1; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
+    .progress-bytes { font-size: 0.8rem; color: var(--text-2); font-variant-numeric: tabular-nums; text-align: right; }
+    .bar { width: 100%; height: 7px; background: rgba(255,255,255,0.07); border-radius: 999px; overflow: hidden; }
+    .bar-fill { height: 100%; width: 0%; border-radius: 999px; background: linear-gradient(90deg, #1d8fd0, var(--accent)); transition: width 0.25s ease; }
+    .bar.slim { height: 3px; margin-top: 0.45rem; }
+    .stat-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.75rem; margin-top: 1rem; }
+    .stat { min-width: 0; }
+    .stat-label { font-size: 0.64rem; font-weight: 600; letter-spacing: 0.09em; text-transform: uppercase; color: var(--text-3); }
+    .stat-value { font-size: 0.85rem; color: var(--text); margin-top: 0.2rem; font-variant-numeric: tabular-nums; }
+
+    .progress-list { max-height: 250px; overflow-y: auto; padding: 0.5rem; }
+    .progress-row { padding: 0.6rem 0.65rem; border-radius: var(--radius); }
+    .progress-row + .progress-row { margin-top: 0.15rem; }
+    .progress-row:hover { background: rgba(255,255,255,0.03); }
+    .progress-row-top { display: flex; justify-content: space-between; align-items: baseline; gap: 0.65rem; }
+    .progress-row-name { font-size: 0.82rem; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
+    .progress-row-state { font-size: 0.75rem; color: var(--text-3); flex-shrink: 0; font-variant-numeric: tabular-nums; }
+    .progress-row-state.ok { color: var(--ok); }
+    .progress-row-state.fail { color: var(--danger); }
+
+    .foot { margin-top: 2.75rem; padding-top: 1.25rem; border-top: 1px solid var(--line); font-size: 0.75rem; color: var(--text-3); text-align: center; }
+
+    @media (max-width: 560px) {
+        .wrap { padding: 1.75rem 1.1rem 3rem; }
+        .topbar-inner { padding: 0.75rem 1.1rem; }
+        .folder-name { font-size: 1.5rem; }
+        .file-grid { grid-template-columns: repeat(auto-fill, minmax(148px, 1fr)); gap: 0.7rem; }
+        .stat-row { grid-template-columns: 1fr 1fr; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+        * { transition: none !important; }
+        .file-card:hover { transform: none; }
+    }
 "#;
 
 /// Drives multi-file uploads via `XMLHttpRequest` (its `upload.onprogress`
@@ -536,8 +797,13 @@ const UPLOAD_SCRIPT_TEMPLATE: &str = r#"
         return s + 's';
     }
 
-    browseLink.addEventListener('click', function (e) { e.preventDefault(); fileInput.click(); });
-    uploadZone.addEventListener('click', function (e) { if (e.target !== browseLink) fileInput.click(); });
+    browseLink.addEventListener('click', function (e) { e.stopPropagation(); fileInput.click(); });
+    uploadZone.addEventListener('click', function () { fileInput.click(); });
+    // The dropzone is a div with role="button", so Enter/Space have to be
+    // wired up by hand to match native button behaviour.
+    uploadZone.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fileInput.click(); }
+    });
     fileInput.addEventListener('change', function () {
         if (fileInput.files.length) startUpload(Array.prototype.slice.call(fileInput.files));
     });
@@ -566,13 +832,13 @@ const UPLOAD_SCRIPT_TEMPLATE: &str = r#"
 
         var rows = files.map(function (file) {
             var row = document.createElement('div');
-            row.className = 'file-progress-row';
-            row.innerHTML = '<div class="file-progress-top"><span class="file-progress-name"></span>'
-                + '<span class="file-progress-pct">0%</span></div>'
-                + '<div class="progress-bar-track small"><div class="progress-bar-fill"></div></div>';
-            row.querySelector('.file-progress-name').textContent = file.name;
+            row.className = 'progress-row';
+            row.innerHTML = '<div class="progress-row-top"><span class="progress-row-name"></span>'
+                + '<span class="progress-row-state">0%</span></div>'
+                + '<div class="bar slim"><div class="bar-fill"></div></div>';
+            row.querySelector('.progress-row-name').textContent = file.name;
             fileListEl.appendChild(row);
-            return { fill: row.querySelector('.progress-bar-fill'), pct: row.querySelector('.file-progress-pct') };
+            return { fill: row.querySelector('.bar-fill'), pct: row.querySelector('.progress-row-state') };
         });
 
         var elapsedTimer = setInterval(function () {
@@ -597,7 +863,20 @@ const UPLOAD_SCRIPT_TEMPLATE: &str = r#"
             }
         }
 
-        function uploadOne(i) {
+        // Posts the raw File as the request body (not a multipart form) so
+        // the server gets an exact Content-Length up front and can forward
+        // bytes to Telegram as they arrive instead of buffering the whole
+        // file to disk first — see `upload_file_streaming`. A useful side
+        // effect: because the server can only drain the body as fast as
+        // Telegram accepts it, this progress bar now reflects the real
+        // end-to-end rate rather than just filling the local buffer.
+        //
+        // Streaming means the server can't retry a failed upload (the body
+        // is consumed once), so retrying is done here instead — the File is
+        // still in memory, so the whole request can simply be re-sent.
+        var MAX_ATTEMPTS = 3;
+
+        function uploadOne(i, attempt) {
             if (i >= files.length) {
                 clearInterval(elapsedTimer);
                 overallPercent.textContent = '100%';
@@ -605,10 +884,30 @@ const UPLOAD_SCRIPT_TEMPLATE: &str = r#"
                 setTimeout(function () { location.reload(); }, 700);
                 return;
             }
+            attempt = attempt || 1;
             var file = files[i];
             currentLoaded = 0;
+
+            function failedOrRetry(reason) {
+                if (attempt < MAX_ATTEMPTS) {
+                    rows[i].pct.textContent = 'Retrying ' + (attempt + 1) + '/' + MAX_ATTEMPTS;
+                    rows[i].pct.className = 'progress-row-state';
+                    rows[i].fill.style.width = '0%';
+                    currentLoaded = 0;
+                    setTimeout(function () { uploadOne(i, attempt + 1); }, 1500 * attempt);
+                    return;
+                }
+                console.error('Upload failed for ' + file.name + ': ' + reason);
+                rows[i].pct.textContent = 'Failed';
+                rows[i].pct.className = 'progress-row-state fail';
+                uploadOne(i + 1, 1);
+            }
+
             var xhr = new XMLHttpRequest();
-            xhr.open('POST', '/s/' + TOKEN + '/files');
+            xhr.open('POST', '/s/' + TOKEN + '/files/stream');
+            // Header values must be ASCII, so a name with non-ASCII
+            // characters is percent-encoded here and decoded server-side.
+            xhr.setRequestHeader('X-Filename', encodeURIComponent(file.name));
             xhr.upload.addEventListener('progress', function (e) {
                 if (!e.lengthComputable) return;
                 currentLoaded = e.loaded;
@@ -621,27 +920,22 @@ const UPLOAD_SCRIPT_TEMPLATE: &str = r#"
                 if (xhr.status >= 200 && xhr.status < 300) {
                     rows[i].fill.style.width = '100%';
                     rows[i].pct.textContent = 'Done';
-                    rows[i].pct.className = 'file-progress-pct ok';
+                    rows[i].pct.className = 'progress-row-state ok';
                     uploadedBase += file.size;
                     currentLoaded = 0;
                     updateOverall();
+                    uploadOne(i + 1, 1);
                 } else {
-                    rows[i].pct.textContent = 'Failed';
-                    rows[i].pct.className = 'file-progress-pct fail';
+                    failedOrRetry('HTTP ' + xhr.status + ' ' + (xhr.responseText || ''));
                 }
-                uploadOne(i + 1);
             });
             xhr.addEventListener('error', function () {
-                rows[i].pct.textContent = 'Failed';
-                rows[i].pct.className = 'file-progress-pct fail';
-                uploadOne(i + 1);
+                failedOrRetry('network error');
             });
-            var formData = new FormData();
-            formData.append('file', file);
-            xhr.send(formData);
+            xhr.send(file);
         }
 
-        uploadOne(0);
+        uploadOne(0, 1);
     }
 })();
 "#;
@@ -700,6 +994,14 @@ fn file_type_icon_svg(category: &str) -> &'static str {
 // `X`/`RotateCcw`/`AlertCircle` imports) — hand-inlined as raw SVG here
 // since this page is plain server-rendered HTML with no icon library.
 const FILE_ICON_GENERIC: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>"#;
+
+// Chrome icons (brand mark, buttons, empty/drop states), same stroke-based
+// lucide-react family the desktop app uses for its own iconography.
+const ICON_SHIELD: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>"#;
+const ICON_DOWNLOAD: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>"#;
+const ICON_TRASH: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>"#;
+const ICON_UPLOAD: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M17 8l-5-5-5 5"/><path d="M12 3v12"/></svg>"#;
+const ICON_FOLDER: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h4l2 3h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2z"/></svg>"#;
 const FILE_ICON_IMAGE: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="M21 15l-5-5L5 21"/></svg>"#;
 const FILE_ICON_VIDEO: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="20" rx="2"/><line x1="7" y1="2" x2="7" y2="22"/><line x1="17" y1="2" x2="17" y2="22"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="2" y1="7" x2="7" y2="7"/><line x1="2" y1="17" x2="7" y2="17"/><line x1="17" y1="17" x2="22" y2="17"/><line x1="17" y1="7" x2="22" y2="7"/></svg>"#;
 const FILE_ICON_AUDIO: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>"#;
@@ -929,7 +1231,7 @@ async fn download_split_file_response(
     resp.insert_header(("Accept-Ranges", "bytes"));
     resp.insert_header((
         "Content-Disposition",
-        format!("attachment; filename=\"{}\"", filename),
+        crate::server::content_disposition_attachment(&filename),
     ));
     resp.streaming(stream)
 }
@@ -976,8 +1278,26 @@ async fn download_file(
                         Media::Document(document) => document.mime_type().unwrap_or("application/octet-stream").to_string(),
                         _ => "application/octet-stream".to_string(),
                     };
+                    // Without a filename here `build_media_response` emits no
+                    // Content-Disposition at all, so the browser renders the
+                    // file inline (an image/PDF/video just opens in a tab)
+                    // instead of downloading it. Name resolution follows the
+                    // same convention as `list_folder_share_files`: a caption
+                    // is the display name when present (that's what rename
+                    // writes), otherwise the document's own name.
+                    let caption = message.text();
+                    let fallback_name = match &media {
+                        Media::Document(document) => document.name().to_string(),
+                        Media::Photo(_) => "Photo.jpg".to_string(),
+                        _ => format!("file-{}", message_id),
+                    };
+                    let download_name = sanitize_filename(if caption.is_empty() {
+                        &fallback_name
+                    } else {
+                        caption
+                    });
                     return crate::server::build_media_response(
-                        &client, &media, &req, &mime, None,
+                        &client, &media, &req, &mime, Some(&download_name),
                         crate::server::StreamingExtras { extra_headers: vec![], log_label: "Folder share download" },
                     );
                 }
@@ -1371,6 +1691,192 @@ async fn upload_file(
     }
 }
 
+/// Streams an incoming upload straight through to Telegram as its bytes
+/// arrive, instead of buffering the whole file to a temp file first and only
+/// then starting the Telegram upload (what `upload_file`'s multipart path
+/// does). For a large file that roughly halves wall-clock time: the
+/// browser→server and server→Telegram transfers overlap instead of running
+/// strictly back to back.
+///
+/// This needs the exact byte count *before* the first byte goes to Telegram
+/// (`upload_stream` derives its part count from it), which a
+/// `multipart/form-data` body can't reliably supply up front — hence the
+/// raw-body protocol here: the file IS the entire request body, its size is
+/// `Content-Length`, and its name rides along in `X-Filename`
+/// (percent-encoded, since header values must be ASCII).
+///
+/// Deliberate tradeoff: a request body can only be read once, so a failed
+/// Telegram upload can't be retried server-side the way the temp-file path
+/// retries by reopening the file. The browser still holds the `File` object,
+/// so retrying is the client's job here — see `UPLOAD_SCRIPT_TEMPLATE`,
+/// which re-sends the whole request on failure.
+#[post("/s/{token}/files/stream")]
+async fn upload_file_streaming(
+    req: HttpRequest,
+    path: web::Path<String>,
+    payload: web::Payload,
+    db_conn: web::Data<DbConnection>,
+    tg_state: web::Data<Arc<TelegramState>>,
+    bw_manager: web::Data<Arc<BandwidthManager>>,
+    net_config: web::Data<Arc<NetworkConfig>>,
+) -> impl Responder {
+    let token = path.into_inner();
+    let row = match authorize_folder_share(&req, &token, SharePermissions::UPLOAD, &db_conn).await {
+        Ok(row) => row,
+        Err(response) => return response,
+    };
+
+    // Exact size up front — required by `upload_stream`, and it lets an
+    // oversized upload be rejected before a single byte crosses the wire
+    // (the multipart path can only abort partway through).
+    let size = match req
+        .headers()
+        .get(actix_web::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        Some(size) if size > 0 => size,
+        Some(_) => return HttpResponse::BadRequest().body("File is empty"),
+        None => {
+            return HttpResponse::LengthRequired()
+                .body("Content-Length is required for a streaming upload")
+        }
+    };
+    if size > MAX_SHARE_UPLOAD_BYTES {
+        return HttpResponse::PayloadTooLarge().body("File exceeds the maximum allowed size");
+    }
+
+    let filename = req
+        .headers()
+        .get("X-Filename")
+        .and_then(|value| value.to_str().ok())
+        .map(|raw| {
+            urlencoding::decode(raw)
+                .map(|decoded| decoded.into_owned())
+                .unwrap_or_else(|_| raw.to_string())
+        })
+        .map(|name| sanitize_filename(&name))
+        .unwrap_or_else(|| "file".to_string());
+
+    let client_opt = { tg_state.client.lock().await.clone() };
+    let Some(client) = client_opt else {
+        return HttpResponse::ServiceUnavailable().body("Telegram client is not connected");
+    };
+
+    if let Err(error) = bw_manager.try_reserve_up(size) {
+        return HttpResponse::BadRequest().body(error);
+    }
+    let peer = match resolve_peer(&client, row.folder_id, &tg_state.peer_cache).await {
+        Ok(peer) => peer,
+        Err(error) => {
+            bw_manager.release_up(size);
+            return HttpResponse::InternalServerError().body(error);
+        }
+    };
+
+    // Bridge actix's body stream into an `AsyncRead` grammers can consume
+    // directly, so nothing is ever staged on local disk.
+    let byte_stream =
+        payload.map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error));
+    let mut reader = tokio_util::io::StreamReader::new(byte_stream);
+
+    let result = if split_file::should_split(size) {
+        stream_split_file_to_telegram(&client, &peer, &net_config, filename, &mut reader, size).await
+    } else {
+        stream_single_file_to_telegram(&client, &peer, &net_config, filename, &mut reader, size).await
+    };
+
+    match result {
+        Ok(message_id) => HttpResponse::Ok().json(serde_json::json!({ "message_id": message_id })),
+        Err(error) => {
+            bw_manager.release_up(size);
+            HttpResponse::InternalServerError().body(error)
+        }
+    }
+}
+
+async fn stream_single_file_to_telegram<R>(
+    client: &grammers_client::Client,
+    peer: &Peer,
+    net_config: &NetworkConfig,
+    filename: String,
+    reader: &mut R,
+    size: u64,
+) -> Result<i32, String>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let uploaded_file = client
+        .upload_stream(reader, size as usize, filename)
+        .await
+        .map_err(map_error)?;
+    let message = InputMessage::new().text("").file(uploaded_file);
+    send_message_with_retry(client, peer, message, net_config).await
+}
+
+/// Splits a streamed upload across multiple part messages (see `split_file`)
+/// by taking each part's byte count off the front of the same body stream in
+/// order. No seeking is involved — which is what makes this work at all on a
+/// network stream — and `part_ranges` already yields its ranges front-to-back.
+async fn stream_split_file_to_telegram<R>(
+    client: &grammers_client::Client,
+    peer: &Peer,
+    net_config: &NetworkConfig,
+    filename: String,
+    reader: &mut R,
+    size: u64,
+) -> Result<i32, String>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let ranges = split_file::part_ranges(size);
+    let part_count = ranges.len();
+    let mut part_ids: Vec<i32> = Vec::with_capacity(part_count);
+
+    for (index, (_, len)) in ranges.iter().enumerate() {
+        let mut part = (&mut *reader).take(*len);
+        let uploaded_file = client
+            .upload_stream(&mut part, *len as usize, format!("part{:04}", index + 1))
+            .await
+            .map_err(map_error)?;
+        let caption = split_file::part_caption(index, part_count, &filename);
+        let message = InputMessage::new().text(caption).file(uploaded_file);
+        match send_message_with_retry(client, peer, message, net_config).await {
+            Ok(id) => part_ids.push(id),
+            // Abort without sending a manifest: already-sent parts stay
+            // hidden behind their own marker but orphaned — the same accepted
+            // "duplicate/orphan over data loss" tradeoff used elsewhere.
+            Err(error) => {
+                return Err(format!(
+                    "Split upload failed on part {}/{}: {}",
+                    index + 1,
+                    part_count,
+                    error
+                ))
+            }
+        }
+    }
+
+    let manifest = split_file::SplitManifest {
+        schema_version: 1,
+        name: filename,
+        size,
+        part_count: part_count as u32,
+        part_ids,
+    };
+    let manifest_text = split_file::manifest_text(&manifest)?;
+    send_message_with_retry(client, peer, InputMessage::new().text(manifest_text), net_config)
+        .await
+        .map_err(|error| {
+            format!(
+                "All {} parts uploaded, but the manifest failed to send: {}",
+                part_count, error
+            )
+        })
+}
+
 /// "Update" replaces the content of a caller-specified `message_id` (the
 /// link holder discovers ids via the list route) rather than overwriting
 /// by filename, which would be ambiguous with duplicate names. The new
@@ -1511,6 +2017,7 @@ pub fn configure_folder_share_routes(cfg: &mut web::ServiceConfig) {
         .service(list_files_json)
         .service(download_file)
         .service(download_file_thumbnail)
+        .service(upload_file_streaming)
         .service(upload_file)
         .service(update_file)
         .service(delete_file);

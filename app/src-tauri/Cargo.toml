@@ -26,6 +26,10 @@ grammers-session = { git = "https://github.com/Lonami/grammers", rev = "d07f96f"
 grammers-mtsender = { git = "https://github.com/Lonami/grammers", rev = "d07f96f", features = ["proxy"] }
 grammers-tl-types = { git = "https://github.com/Lonami/grammers", rev = "d07f96f" }
 tokio = { version = "1", features = ["full"] }
+# `io` feature provides `StreamReader`, used to hand an incoming HTTP body
+# stream straight to grammers' `upload_stream` without buffering it to disk
+# first (see `folder_share_routes::upload_file_streaming`).
+tokio-util = { version = "0.7", features = ["io"] }
 
 tauri-plugin-store = "2"
 tauri-plugin-window-state = "2"
