@@ -35,6 +35,12 @@ function jobLabel(job: RemoteJob): string {
       return `Copy "${baseName(job.action.relative_path)}"`;
     case "move_entry":
       return `Move "${baseName(job.action.relative_path)}"`;
+    // Share-link requests ride the same queue, so they show up here too —
+    // useful for seeing that one is still waiting on the desktop app.
+    case "create_folder_share":
+      return `Create share link for "${job.action.folder_name}"`;
+    case "revoke_folder_share":
+      return `Revoke share link ${job.action.share_id}`;
   }
 }
 

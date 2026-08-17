@@ -16,6 +16,10 @@ import { downloadFile } from "./download";
 
 const CATALOG_MARKER = "[TD-CATALOG]";
 const JOBS_MARKER = "[TD-REMOTE-JOBS]";
+// Desktop → mobile only: the live folder-share list plus desktop's current
+// public base URL. Mobile never writes this one; it requests changes through
+// the job queue instead.
+const SHARES_MARKER = "[TD-SHARES]";
 const SCAN_PAGE_SIZE = 50;
 const SCAN_MAX_PAGES = 6; // up to 300 messages, matching desktop's own scan cap
 
@@ -55,7 +59,31 @@ export type RemoteJobAction =
       relative_path: string;
       dest_source_id: string;
       dest_folder_path: string;
-    };
+    }
+  // Asking desktop to create a real Temp Link. This phone can't serve one
+  // itself (no HTTP server, no tunnel, and the OS suspends background apps),
+  // and desktop resolves share tokens only from its own database.
+  //
+  // `share_id` is minted HERE, not by desktop, so a replayed job is a no-op
+  // instead of a second live share — the jobs blob is last-write-wins with no
+  // locking. `password_hash` is bcrypt-hashed on-device because this blob
+  // lives indefinitely in Saved Messages and must never carry plaintext.
+  // `folder_id` must be the raw channel id (`supergroupId`), NOT a TDLib
+  // `-100…` chat id, or desktop's peer lookup will never match it.
+  | {
+      type: "create_folder_share";
+      share_id: string;
+      folder_id: number | null;
+      folder_name: string;
+      can_upload: boolean;
+      can_download: boolean;
+      can_update: boolean;
+      can_delete: boolean;
+      username?: string | null;
+      password_hash?: string | null;
+      expires_at?: number | null;
+    }
+  | { type: "revoke_folder_share"; share_id: string };
 
 export type RemoteJobStatus = "pending" | "completed" | "failed";
 
@@ -116,11 +144,47 @@ async function downloadJson<T>(fileId: number, fileName: string): Promise<T> {
   return JSON.parse(await file.text());
 }
 
-async function publishJson(chatId: number, marker: string, fileName: string, data: unknown): Promise<void> {
-  const existing = await findMarkerMessage(chatId, marker);
-  if (existing) {
-    await deleteFile(chatId, existing.messageId);
+// `findMarkerMessage` only scans the newest ~300 messages, so "not found"
+// genuinely means either "never created" or "pushed out of the scan window by
+// newer messages" — and those need opposite handling. Treating the second as
+// the first makes mobile publish a fresh one-item blob that erases the real
+// one. Remembering that we've seen a marker before lets us fail loudly
+// instead.
+const SEEN_MARKER_PREFIX = "remote_sync_seen_marker_";
+
+async function noteMarkerSeen(marker: string, messageId: number): Promise<void> {
+  await AsyncStorage.setItem(SEEN_MARKER_PREFIX + marker, String(messageId));
+}
+
+async function hasSeenMarkerBefore(marker: string): Promise<boolean> {
+  return (await AsyncStorage.getItem(SEEN_MARKER_PREFIX + marker)) !== null;
+}
+
+/// Like `findMarkerMessage`, but throws rather than reporting "absent" for a
+/// marker this device has previously seen.
+async function findMarkerMessageStrict(chatId: number, marker: string): Promise<MarkerMatch | null> {
+  const match = await findMarkerMessage(chatId, marker);
+  if (match) {
+    await noteMarkerSeen(marker, match.messageId);
+    return match;
   }
+  if (await hasSeenMarkerBefore(marker)) {
+    throw new Error(
+      `${marker} was not found in the newest messages, but this device has seen it before. ` +
+        `Refusing to continue so an existing list isn't overwritten — clear some Saved Messages ` +
+        `clutter, or open the desktop app to republish.`,
+    );
+  }
+  return null;
+}
+
+async function publishJson(chatId: number, marker: string, fileName: string, data: unknown): Promise<void> {
+  // Locate the old marker but DON'T delete it yet: send the replacement
+  // first, then remove the old one. Deleting up front (as this used to do)
+  // means a failed send leaves no blob at all — silently wiping the whole
+  // job queue or share list. Desktop's `publish_json` already orders it this
+  // way; a duplicate marker is recoverable, a missing one isn't.
+  const existing = await findMarkerMessageStrict(chatId, marker);
 
   const tempDir = new Directory(Paths.cache, "remote-sync");
   if (!tempDir.exists) tempDir.create({ intermediates: true, idempotent: true });
@@ -134,6 +198,58 @@ async function publishJson(chatId: number, marker: string, fileName: string, dat
   } finally {
     if (tempFile.exists) tempFile.delete();
   }
+
+  if (existing) {
+    await deleteFile(chatId, existing.messageId);
+  }
+}
+
+/// One share as desktop publishes it. Mirrors `PublishedShare` in
+/// `app/src-tauri/src/remote_catalog.rs`. Carries no password material —
+/// only whether one is set.
+export interface PublishedShare {
+  id: string;
+  folder_id?: number | null;
+  folder_name: string;
+  /// Bitfield, matching `SharePermissionBits`.
+  permissions: number;
+  has_password: boolean;
+  username?: string | null;
+  expires_at?: number | null;
+  created_at: number;
+}
+
+/// Desktop's published share list plus the base URL to build links from.
+/// Mirrors `SharePublication` in `remote_catalog.rs`.
+export interface SharePublication {
+  /// False when desktop has no public tunnel up — `base_url` is then a
+  /// loopback address that's useless from this phone, so the UI must show a
+  /// "waiting for your PC" state rather than an unusable link.
+  public: boolean;
+  base_url: string;
+  updated_at: number;
+  shares: PublishedShare[];
+}
+
+/// Reads the share list desktop publishes. Returns `null` when desktop has
+/// never published one (i.e. it hasn't run since this feature shipped), which
+/// the UI distinguishes from "published, but empty".
+export async function fetchSharePublication(): Promise<SharePublication | null> {
+  const chatId = await savedMessagesChatId();
+  const match = await findMarkerMessageStrict(chatId, SHARES_MARKER);
+  if (!match) return null;
+  return downloadJson<SharePublication>(match.fileId, match.name);
+}
+
+/// Builds the URL for a share, or `null` when it can't be served right now.
+/// Deliberately refuses to hand back desktop's loopback fallback: that URL
+/// only works on the PC itself, so showing it here would look like a working
+/// link that silently fails for everyone.
+export function buildShareLink(publication: SharePublication, shareId: string): string | null {
+  if (!publication.public) return null;
+  const base = publication.base_url.replace(/\/+$/, "");
+  if (base.includes("127.0.0.1") || base.includes("localhost")) return null;
+  return `${base}/s/${shareId}`;
 }
 
 export async function fetchCatalog(): Promise<SourceCatalog[]> {
@@ -144,7 +260,7 @@ export async function fetchCatalog(): Promise<SourceCatalog[]> {
 }
 
 async function fetchJobs(chatId: number): Promise<RemoteJob[]> {
-  const match = await findMarkerMessage(chatId, JOBS_MARKER);
+  const match = await findMarkerMessageStrict(chatId, JOBS_MARKER);
   if (!match) return [];
   return downloadJson<RemoteJob[]>(match.fileId, match.name);
 }
@@ -239,4 +355,45 @@ export function requestMoveEntry(
     dest_source_id: destSourceId,
     dest_folder_path: destFolderPath,
   });
+}
+
+// --- Folder shares (Temp Links) ---------------------------------------------
+//
+// This phone can't serve a share link itself, so creating one means asking
+// desktop to do it and waiting for desktop to publish the result. See
+// `RemoteJobAction`'s `create_folder_share` docs for why the token is minted
+// here and why the password arrives already hashed.
+
+/// `folderId` MUST be the raw channel id (a folder's `supergroupId`), not a
+/// TDLib `-100…` chat id: desktop matches against the raw id, so passing the
+/// chat id produces a share that can never be served.
+export function requestCreateFolderShare(params: {
+  shareId: string;
+  folderId: number | null;
+  folderName: string;
+  canUpload: boolean;
+  canDownload: boolean;
+  canUpdate: boolean;
+  canDelete: boolean;
+  username?: string | null;
+  passwordHash?: string | null;
+  expiresAt?: number | null;
+}): Promise<RemoteJob> {
+  return submitJob({
+    type: "create_folder_share",
+    share_id: params.shareId,
+    folder_id: params.folderId,
+    folder_name: params.folderName,
+    can_upload: params.canUpload,
+    can_download: params.canDownload,
+    can_update: params.canUpdate,
+    can_delete: params.canDelete,
+    username: params.username ?? null,
+    password_hash: params.passwordHash ?? null,
+    expires_at: params.expiresAt ?? null,
+  });
+}
+
+export function requestRevokeFolderShare(shareId: string): Promise<RemoteJob> {
+  return submitJob({ type: "revoke_folder_share", share_id: shareId });
 }
