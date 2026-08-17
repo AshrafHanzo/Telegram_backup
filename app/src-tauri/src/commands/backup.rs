@@ -19,6 +19,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use crate::bandwidth::BandwidthManager;
 use crate::crypto::state::CryptoState;
 use crate::db::DbConnection;
+use crate::split_file;
 use crate::vpn_optimizer::NetworkConfig;
 use crate::TelegramState;
 
@@ -784,11 +785,27 @@ async fn backup_one_file(
     // before the replacement upload has succeeded.
     if let Some((previous_message_id, _, _)) = previous {
         if previous_message_id != new_message_id {
-            if let Err(error) = client.delete_messages(peer, &[previous_message_id]).await {
-                log::warn!(
-                    "Failed to delete superseded backup message {} for {}: {}",
-                    previous_message_id, relative_str, error
-                );
+            // The previous backup may itself have been a split file (see
+            // `split_file`) — if so, its manifest's `part_ids` must be
+            // deleted too, or every one of its parts is orphaned forever on
+            // every single content change (an unbounded storage leak, not
+            // just harmless clutter).
+            let mut ids_to_delete = vec![previous_message_id];
+            if let Ok(messages) = client.get_messages_by_id(peer, &[previous_message_id]).await {
+                if let Some(Some(msg)) = messages.first() {
+                    if let Some(manifest) = split_file::parse_manifest(msg.text()) {
+                        ids_to_delete = manifest.part_ids;
+                        ids_to_delete.push(previous_message_id);
+                    }
+                }
+            }
+            for batch in ids_to_delete.chunks(100) {
+                if let Err(error) = client.delete_messages(peer, batch).await {
+                    log::warn!(
+                        "Failed to delete superseded backup message(s) for {}: {}",
+                        relative_str, error
+                    );
+                }
             }
         }
     }

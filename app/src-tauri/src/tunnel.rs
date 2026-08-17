@@ -141,56 +141,84 @@ fn extract_tunnel_url(line: &str) -> Option<String> {
 /// Starts the quick tunnel in the background and updates `state` once (and
 /// if) a public URL is discovered. Best-effort throughout: any failure just
 /// leaves `state.base_url()` at `None`, which callers treat as "tunnel not
-/// available, use the local address instead."
+/// available, use the local address instead" — but unlike a one-shot attempt,
+/// this keeps retrying with a backoff for as long as the app runs, so a
+/// transient failure (a momentary network hiccup, DNS blip, cloudflared
+/// exiting for no clear reason) self-heals instead of leaving the tunnel
+/// permanently unavailable until the next full app restart.
 pub fn start(app: AppHandle, local_port: u16, state: Arc<TunnelState>) {
     tauri::async_runtime::spawn(async move {
-        let binary = match resolve_binary(&app).await {
-            Ok(path) => path,
-            Err(error) => {
-                log::warn!("Temp Link public tunnel unavailable: {}", error);
-                return;
-            }
-        };
+        // Binary resolution failing (download blocked, no network at all)
+        // is much less likely to change moment-to-moment than a running
+        // tunnel process exiting, so it gets a longer backoff — no point
+        // hammering a download URL that just failed a second ago.
+        const RESOLVE_RETRY_DELAY_SECS: u64 = 300;
+        const RESPAWN_RETRY_DELAY_SECS: u64 = 15;
 
-        let mut child = match Command::new(&binary)
-            .arg("tunnel")
-            .arg("--url")
-            .arg(format!("http://127.0.0.1:{}", local_port))
-            .arg("--no-autoupdate")
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(error) => {
-                log::warn!("Failed to start cloudflared tunnel: {}", error);
-                return;
-            }
-        };
-
-        let Some(stderr) = child.stderr.take() else {
-            log::warn!("cloudflared started but its output could not be captured");
-            return;
-        };
-
-        let mut lines = BufReader::new(stderr).lines();
-        let url_state = state.public_url.clone();
-        while let Ok(Some(line)) = lines.next_line().await {
-            log::debug!("[cloudflared] {}", line);
-            if let Some(url) = extract_tunnel_url(&line) {
-                log::info!("Temp Link public tunnel is live: {}", url);
-                if let Ok(mut guard) = url_state.lock() {
-                    *guard = Some(url);
+        let binary = loop {
+            match resolve_binary(&app).await {
+                Ok(path) => break path,
+                Err(error) => {
+                    log::warn!(
+                        "Temp Link public tunnel unavailable, retrying in {}s: {}",
+                        RESOLVE_RETRY_DELAY_SECS, error
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(RESOLVE_RETRY_DELAY_SECS)).await;
                 }
             }
-        }
+        };
 
-        // The process exited (or its stderr closed) — the tunnel is no
-        // longer usable; clear the URL so sharing falls back to local-only.
-        if let Ok(mut guard) = state.public_url.lock() {
-            *guard = None;
+        loop {
+            let mut child = match Command::new(&binary)
+                .arg("tunnel")
+                .arg("--url")
+                .arg(format!("http://127.0.0.1:{}", local_port))
+                .arg("--no-autoupdate")
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+            {
+                Ok(child) => child,
+                Err(error) => {
+                    log::warn!(
+                        "Failed to start cloudflared tunnel, retrying in {}s: {}",
+                        RESPAWN_RETRY_DELAY_SECS, error
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(RESPAWN_RETRY_DELAY_SECS)).await;
+                    continue;
+                }
+            };
+
+            let Some(stderr) = child.stderr.take() else {
+                log::warn!("cloudflared started but its output could not be captured");
+                tokio::time::sleep(std::time::Duration::from_secs(RESPAWN_RETRY_DELAY_SECS)).await;
+                continue;
+            };
+
+            let mut lines = BufReader::new(stderr).lines();
+            let url_state = state.public_url.clone();
+            while let Ok(Some(line)) = lines.next_line().await {
+                log::debug!("[cloudflared] {}", line);
+                if let Some(url) = extract_tunnel_url(&line) {
+                    log::info!("Temp Link public tunnel is live: {}", url);
+                    if let Ok(mut guard) = url_state.lock() {
+                        *guard = Some(url);
+                    }
+                }
+            }
+
+            // The process exited (or its stderr closed) — the tunnel is no
+            // longer usable; clear the URL so sharing falls back to
+            // local-only while we retry standing up a fresh one.
+            if let Ok(mut guard) = state.public_url.lock() {
+                *guard = None;
+            }
+            log::warn!(
+                "cloudflared tunnel process ended, retrying in {}s",
+                RESPAWN_RETRY_DELAY_SECS
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(RESPAWN_RETRY_DELAY_SECS)).await;
         }
-        log::warn!("cloudflared tunnel process ended");
     });
 }

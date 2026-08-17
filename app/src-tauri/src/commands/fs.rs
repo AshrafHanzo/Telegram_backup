@@ -1,7 +1,7 @@
 use tauri::{State, Emitter};
 use std::sync::Arc;
 use grammers_client::types::{Media, Peer};
-use grammers_client::InputMessage;
+use grammers_client::{Client, InputMessage};
 use grammers_tl_types as tl;
 use crate::TelegramState;
 use crate::models::{FolderMetadata, FileMetadata};
@@ -9,6 +9,7 @@ use crate::bandwidth::{BandwidthManager, BandwidthReservation};
 use crate::commands::utils::{media_size, resolve_peer, map_error};
 use crate::audit_sync::AUDIT_LOG_MARKER;
 use crate::remote_catalog::{CATALOG_MARKER, JOBS_MARKER};
+use crate::split_file;
 use crate::vpn_optimizer::{NetworkConfig, backoff_ms};
 use crate::db::DbConnection;
 use crate::crypto::envelope::encrypt_reader::{EncryptingReader, EncryptionSession};
@@ -896,6 +897,31 @@ impl ProgressReader {
         };
         Ok((reader, size, counter))
     }
+
+    /// Reads exactly `len` bytes starting at `start`, reporting into a
+    /// caller-supplied counter instead of a fresh one — lets every part of a
+    /// split-file upload share one cumulative progress counter across the
+    /// whole logical transfer instead of resetting per part. `upload_stream`
+    /// only requires `AsyncRead + Unpin` on the stream, not `Seek`, so this
+    /// seeks the underlying file once up front and hands back a plain
+    /// bounded reader from there — no intermediate temp file needed.
+    async fn new_range(
+        path: &str,
+        start: u64,
+        len: u64,
+        counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) -> Result<tokio::io::Take<Self>, String> {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let mut file = tokio::fs::File::open(path).await.map_err(|e| e.to_string())?;
+        file.seek(std::io::SeekFrom::Start(start))
+            .await
+            .map_err(|e| e.to_string())?;
+        let reader = Self {
+            inner: tokio::io::BufReader::new(file),
+            bytes_read: counter,
+        };
+        Ok(reader.take(len))
+    }
 }
 
 impl tokio::io::AsyncRead for ProgressReader {
@@ -933,6 +959,109 @@ fn cleanup_partial_file(path: &str) {
             }
         }
     });
+}
+
+/// 512KB — Telegram silently rounds `upload.getFile` offsets down to this
+/// boundary server-side (see `server.rs::build_media_response`'s identical
+/// constant and explanation). A resume must truncate the local partial file
+/// down to this boundary before continuing, so the resumed stream's first
+/// byte lines up exactly with the truncated file's end.
+const DOWNLOAD_CDN_ALIGNMENT: u64 = 524288;
+
+/// Reads the on-disk length of a partial download at `part_path`, or 0 if
+/// it doesn't exist — the raw, not-yet-aligned byte count a previous
+/// attempt got to.
+async fn existing_partial_download_len(part_path: &str) -> u64 {
+    tokio::fs::metadata(part_path).await.map(|m| m.len()).unwrap_or(0)
+}
+
+/// Rounds a raw on-disk length down to a CDN-alignment-safe resume point.
+/// For a split file this must be done relative to whichever PART the offset
+/// falls inside (each part is its own independent Telegram file, so its own
+/// `upload.getFile` offset resets to 0 at the part's start) — aligning the
+/// combined/global offset directly would only coincidentally line up with a
+/// part boundary, since `TELEGRAM_MAX_FILE_SIZE` isn't itself a multiple of
+/// `DOWNLOAD_CDN_ALIGNMENT`. For a plain (non-split) file the whole file IS
+/// the one "part", so both cases share the same per-part rounding logic.
+fn aligned_resume_point(raw_len: u64, total_size: u64, ranges: Option<&[(u64, u64)]>) -> u64 {
+    let raw_len = raw_len.min(total_size.saturating_sub(1));
+    match ranges {
+        Some(ranges) => {
+            let (part_index, raw_offset_in_part) = split_file::locate_offset(ranges, raw_len);
+            let aligned_offset_in_part = (raw_offset_in_part / DOWNLOAD_CDN_ALIGNMENT) * DOWNLOAD_CDN_ALIGNMENT;
+            let consumed_before: u64 = ranges[..part_index].iter().map(|(_, len)| *len).sum();
+            consumed_before + aligned_offset_in_part
+        }
+        None => (raw_len / DOWNLOAD_CDN_ALIGNMENT) * DOWNLOAD_CDN_ALIGNMENT,
+    }
+}
+
+/// Opens `part_path` for writing, truncated and seeked to `resume_from` if
+/// resuming, or freshly created if `resume_from` is 0. Returns the actual
+/// resume point achieved — 0 if anything about resuming failed (missing
+/// file, permissions, seek error), since it's always better to silently
+/// fall back to a fresh download than to abort one over a stale partial
+/// file's problems.
+async fn open_download_file_for_resume(part_path: &str, resume_from: u64) -> Result<(tokio::fs::File, u64), String> {
+    use tokio::io::AsyncSeekExt;
+
+    if resume_from > 0 {
+        if let Ok(mut file) = tokio::fs::OpenOptions::new().write(true).open(part_path).await {
+            if file.set_len(resume_from).await.is_ok() && file.seek(std::io::SeekFrom::Start(resume_from)).await.is_ok() {
+                return Ok((file, resume_from));
+            }
+        }
+    }
+
+    let file = tokio::fs::File::create(part_path).await.map_err(|e| e.to_string())?;
+    Ok((file, 0))
+}
+
+#[cfg(test)]
+mod resume_alignment_tests {
+    use super::*;
+
+    #[test]
+    fn fresh_download_resumes_from_zero() {
+        assert_eq!(aligned_resume_point(0, 10_000_000, None), 0);
+    }
+
+    #[test]
+    fn single_file_rounds_down_to_alignment_boundary() {
+        let raw = DOWNLOAD_CDN_ALIGNMENT * 3 + 12345;
+        assert_eq!(aligned_resume_point(raw, DOWNLOAD_CDN_ALIGNMENT * 10, None), DOWNLOAD_CDN_ALIGNMENT * 3);
+    }
+
+    #[test]
+    fn split_file_aligns_relative_to_its_own_part_not_the_global_offset() {
+        // TELEGRAM_MAX_FILE_SIZE (2_000_000_000) is NOT a multiple of
+        // DOWNLOAD_CDN_ALIGNMENT (524288) — this is exactly the case that
+        // would silently misalign if rounding were done globally instead of
+        // per-part. A raw offset partway into the second part must round
+        // down relative to THAT part's own start, not the whole file's.
+        let ranges = split_file::part_ranges(crate::crypto::policy::TELEGRAM_MAX_FILE_SIZE * 2 + 500);
+        let part_start = ranges[1].0; // second part's start, mid-file
+        let raw = part_start + DOWNLOAD_CDN_ALIGNMENT * 2 + 999; // partway into part 2
+        let resumed = aligned_resume_point(raw, ranges[0].1 + ranges[1].1 + ranges[2].1, Some(&ranges));
+        assert_eq!(resumed, part_start + DOWNLOAD_CDN_ALIGNMENT * 2);
+    }
+
+    #[test]
+    fn split_file_resume_in_first_part_matches_single_file_case() {
+        let ranges = split_file::part_ranges(crate::crypto::policy::TELEGRAM_MAX_FILE_SIZE * 2 + 500);
+        let raw = DOWNLOAD_CDN_ALIGNMENT * 3 + 1;
+        let resumed = aligned_resume_point(raw, ranges[0].1 + ranges[1].1 + ranges[2].1, Some(&ranges));
+        assert_eq!(resumed, DOWNLOAD_CDN_ALIGNMENT * 3);
+    }
+
+    #[test]
+    fn raw_len_at_or_past_total_size_is_clamped_below_it() {
+        // A stale/corrupt partial file that's already >= the expected total
+        // must never produce a resume point >= total_size (which would
+        // leave nothing to download and confuse the calling loop).
+        assert!(aligned_resume_point(10_000_000, 10_000_000, None) < 10_000_000);
+        assert!(aligned_resume_point(50_000_000, 10_000_000, None) < 10_000_000);
+    }
 }
 
 struct PartialFileGuard {
@@ -1250,6 +1379,315 @@ pub async fn cmd_upload_file(
     result
 }
 
+/// Shared retry/backoff wrapper for `client.send_message` — extracted from
+/// what used to be inline-duplicated logic in `cmd_upload_file_inner`'s
+/// standard path, now also used by `upload_split_file` for both part and
+/// manifest messages. Takes the four `NetworkConfig` values directly rather
+/// than the config type itself, so this has no dependency on tauri's
+/// `State` wrapper and is trivially reusable from any context.
+async fn send_with_retry(
+    client: &Client,
+    peer: &Peer,
+    message: InputMessage,
+    max_retries: u32,
+    base_ms: u64,
+    max_ms: u64,
+    respect_flood: bool,
+) -> Result<grammers_client::types::Message, String> {
+    let mut last_err = String::new();
+
+    for attempt in 0..=max_retries {
+        match client.send_message(peer, message.clone()).await {
+            Ok(sent) => return Ok(sent),
+            Err(e) => {
+                let err = map_error(e);
+                log::warn!("send_message attempt {}/{}: {}", attempt + 1, max_retries + 1, err);
+                if respect_flood && err.starts_with("FLOOD_WAIT_") {
+                    if let Ok(secs) = err.trim_start_matches("FLOOD_WAIT_").parse::<u64>() {
+                        let wait = secs.min(300);
+                        log::info!("Respecting FLOOD_WAIT: sleeping {}s", wait);
+                        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                        last_err = err;
+                        continue;
+                    }
+                }
+                last_err = err;
+                if attempt < max_retries {
+                    let delay = backoff_ms(attempt, base_ms, max_ms);
+                    log::info!("Retrying in {}ms...", delay);
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                }
+            }
+        }
+    }
+
+    Err(format!("Send failed after {} attempts: {}", max_retries + 1, last_err))
+}
+
+/// Retries a whole upload attempt (opening a fresh reader + the actual
+/// `client.upload_stream` byte-transfer), unlike `send_with_retry` which
+/// only ever covered the follow-up message send. `upload_stream` gives
+/// grammers no resume-mid-part capability (its `file_id` is generated and
+/// consumed internally, never exposed — see `split_file` module docs for why
+/// the redo unit is "one whole part/file", not individual bytes), so a
+/// failed attempt re-runs `attempt` from scratch.
+///
+/// `attempt` does the whole thing itself (open the reader, call
+/// `client.upload_stream`, return whatever the caller needs) rather than
+/// this helper calling `upload_stream` directly, because `Uploaded` (its
+/// success type) isn't exported from grammers — every existing call site in
+/// this file already relies on type inference instead of naming it, and a
+/// generic wrapper can't return an opaque type its own body doesn't produce.
+///
+/// `bytes_counter` is the same shared, cumulative progress counter every
+/// `ProgressReader`/`ProgressReader::new_range` reader reports into — a
+/// failed attempt's partial reads already added to it, so on failure this
+/// rolls back exactly what THIS attempt contributed before retrying,
+/// otherwise a retried part would double-count bytes and the progress bar
+/// would overshoot 100%.
+async fn upload_with_retry<F, Fut, T>(
+    bytes_counter: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    attempt: F,
+    max_retries: u32,
+    base_ms: u64,
+    max_ms: u64,
+) -> Result<T, String>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    let mut last_err = String::new();
+
+    for retry in 0..=max_retries {
+        let baseline = bytes_counter.load(std::sync::atomic::Ordering::Relaxed);
+        match attempt().await {
+            Ok(value) => return Ok(value),
+            Err(e) => {
+                let current = bytes_counter.load(std::sync::atomic::Ordering::Relaxed);
+                bytes_counter.fetch_sub(current.saturating_sub(baseline), std::sync::atomic::Ordering::Relaxed);
+                last_err = e;
+                log::warn!("upload attempt {}/{}: {}", retry + 1, max_retries + 1, last_err);
+                if retry < max_retries {
+                    let delay = backoff_ms(retry, base_ms, max_ms);
+                    log::info!("Retrying upload in {}ms...", delay);
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                }
+            }
+        }
+    }
+
+    Err(format!("Upload failed after {} attempts: {}", max_retries + 1, last_err))
+}
+
+/// Uploads a file larger than `crypto::policy::TELEGRAM_MAX_FILE_SIZE` as
+/// multiple Telegram messages (see the `split_file` module docs for the
+/// manifest format and design rationale). Called from `cmd_upload_file_inner`
+/// when the file exceeds that limit; returns the manifest message's id via
+/// the exact same `report_message_id` contract the normal path uses, so
+/// callers (including the Backup feature) don't need to know a split
+/// happened at all.
+async fn upload_split_file(
+    path: String,
+    folder_id: Option<i64>,
+    transfer_id: Option<String>,
+    app_handle: tauri::AppHandle,
+    state: State<'_, TelegramState>,
+    bw_state: State<'_, Arc<BandwidthManager>>,
+    net_config: State<'_, std::sync::Arc<NetworkConfig>>,
+    remote_name_override: Option<String>,
+) -> Result<String, String> {
+    let size = tokio::fs::metadata(&path).await.map_err(|e| e.to_string())?.len();
+    // Reserve for the FULL logical size once, up front — mirrors the
+    // single-message path's invariant of one reservation per logical
+    // transfer, not one per part.
+    let mut bandwidth_reservation = BandwidthReservation::upload(bw_state.inner().clone(), size)?;
+
+    let tid = transfer_id.unwrap_or_default();
+
+    let client_opt = { state.client.lock().await.clone() };
+    #[cfg(debug_assertions)]
+    if client_opt.is_none() {
+        log::info!("[MOCK] Uploaded split file {} to {:?}", path, folder_id);
+        return Ok("Mock upload successful".to_string());
+    }
+    let client = client_opt.ok_or_else(|| "Client not connected".to_string())?;
+
+    let report_message_id = remote_name_override.is_some();
+    let file_name = remote_name_override.unwrap_or_else(|| {
+        std::path::Path::new(&path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "file".to_string())
+    });
+
+    let peer = resolve_peer(&client, folder_id, &state.peer_cache).await?;
+    let ranges = split_file::part_ranges(size);
+    let part_count = ranges.len();
+
+    if !tid.is_empty() {
+        let _ = app_handle.emit("upload-progress", ProgressPayload {
+            id: tid.clone(), percent: 0, uploaded_bytes: 0, total_bytes: size, speed_bytes_per_sec: 0,
+        });
+    }
+
+    // One shared counter and ONE progress-reporter task for the whole
+    // logical transfer (not one per part) — this is what keeps the progress
+    // bar climbing continuously across parts instead of resetting to 0% at
+    // the start of every part.
+    let bytes_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let cancelled = state.cancelled_transfers.clone();
+    let progress_tid = tid.clone();
+    let progress_handle = app_handle.clone();
+    let progress_counter = bytes_counter.clone();
+    let progress_task = if !tid.is_empty() {
+        Some(tokio::spawn(async move {
+            let mut last_bytes: u64 = 0;
+            let mut last_time = std::time::Instant::now();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                let current = progress_counter.load(std::sync::atomic::Ordering::Relaxed);
+                let now = std::time::Instant::now();
+                let dt = now.duration_since(last_time).as_secs_f64();
+                let speed = if dt > 0.0 { (current.saturating_sub(last_bytes) as f64 / dt) as u64 } else { 0 };
+                let percent = if size > 0 { ((current as f64 / size as f64) * 100.0).min(99.0) as u8 } else { 0 };
+                let _ = progress_handle.emit("upload-progress", ProgressPayload {
+                    id: progress_tid.clone(), percent, uploaded_bytes: current, total_bytes: size, speed_bytes_per_sec: speed,
+                });
+                last_bytes = current;
+                last_time = now;
+                if current >= size { break; }
+                if cancelled.read().await.contains(&progress_tid) { break; }
+            }
+        }))
+    } else {
+        None
+    };
+
+    if !tid.is_empty() && state.cancelled_transfers.read().await.contains(&tid) {
+        state.cancelled_transfers.write().await.remove(&tid);
+        if let Some(t) = progress_task { t.abort(); }
+        return Err("Transfer cancelled".to_string());
+    }
+
+    let mut part_ids: Vec<i32> = Vec::with_capacity(part_count);
+
+    for (index, (start, len)) in ranges.iter().enumerate() {
+        // Check cancellation between parts too — the per-part cancel
+        // channel below only catches a cancel that arrives WHILE this
+        // specific part's upload_stream is actually running.
+        if !tid.is_empty() && state.cancelled_transfers.read().await.contains(&tid) {
+            state.cancelled_transfers.write().await.remove(&tid);
+            if let Some(t) = progress_task { t.abort(); }
+            return Err("Transfer cancelled".to_string());
+        }
+
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        if !tid.is_empty() {
+            get_upload_cancellations().lock().unwrap().insert(tid.clone(), cancel_tx);
+        }
+
+        let client_clone = client.clone();
+        let part_start = *start;
+        let part_len = *len;
+        let part_upload_name = format!("part{:04}", index + 1);
+        let reader_path = path.clone();
+        let reader_counter = bytes_counter.clone();
+        let counter_for_retry = bytes_counter.clone();
+        let max_retries = net_config.retry_attempts();
+        let base_ms = net_config.retry_base_backoff_ms();
+        let max_ms = net_config.retry_max_backoff_ms();
+        let mut upload_task = tokio::spawn(async move {
+            let attempt = || {
+                let client = client_clone.clone();
+                let path = reader_path.clone();
+                let counter = reader_counter.clone();
+                let name = part_upload_name.clone();
+                async move {
+                    let mut reader = ProgressReader::new_range(&path, part_start, part_len, counter).await?;
+                    client.upload_stream(&mut reader, part_len as usize, name).await.map_err(map_error)
+                }
+            };
+            upload_with_retry(&counter_for_retry, attempt, max_retries, base_ms, max_ms).await
+        });
+
+        // Keep the ENTIRE retry loop inside the spawned/cancellable task —
+        // not just the first attempt — so a cancel request can interrupt a
+        // part that's mid-retry, not only its first try.
+        let upload_result = {
+            tokio::select! {
+                res = &mut upload_task => {
+                    if !tid.is_empty() {
+                        get_upload_cancellations().lock().unwrap().remove(&tid);
+                    }
+                    res.map_err(|e| format!("Task join error: {}", e))?
+                }
+                _ = cancel_rx => {
+                    log::info!("Aborting split upload for transfer ID: {}", tid);
+                    upload_task.abort();
+                    state.cancelled_transfers.write().await.remove(&tid);
+                    if let Some(t) = progress_task { t.abort(); }
+                    return Err("Transfer cancelled".to_string());
+                }
+            }
+        };
+
+        let uploaded_file = upload_result?;
+        let caption = split_file::part_caption(index, part_count, &file_name);
+        let message = InputMessage::new().text(caption).file(uploaded_file);
+
+        match send_with_retry(
+            &client, &peer, message,
+            net_config.retry_attempts(), net_config.retry_base_backoff_ms(),
+            net_config.retry_max_backoff_ms(), net_config.should_respect_flood_wait(),
+        ).await {
+            Ok(sent) => part_ids.push(sent.id()),
+            Err(err) => {
+                if let Some(t) = progress_task { t.abort(); }
+                // Abort entirely: no manifest is sent, so this and any
+                // already-sent parts stay hidden (by their own marker) but
+                // orphaned — the same accepted "duplicate/orphan over data
+                // loss" tradeoff used elsewhere in this codebase (e.g. the
+                // backup ledger). The uncommitted BandwidthReservation
+                // releases automatically on drop.
+                return Err(format!(
+                    "Split upload failed on part {}/{}: {}",
+                    index + 1, part_count, err
+                ));
+            }
+        }
+    }
+
+    let manifest = split_file::SplitManifest {
+        schema_version: 1,
+        name: file_name,
+        size,
+        part_count: part_count as u32,
+        part_ids,
+    };
+    let manifest_message = InputMessage::new().text(split_file::manifest_text(&manifest)?);
+    let sent = send_with_retry(
+        &client, &peer, manifest_message,
+        net_config.retry_attempts(), net_config.retry_base_backoff_ms(),
+        net_config.retry_max_backoff_ms(), net_config.should_respect_flood_wait(),
+    ).await.map_err(|err| format!(
+        "All {} parts uploaded, but the manifest failed to send: {}", part_count, err
+    ))?;
+
+    if let Some(t) = progress_task { t.abort(); }
+    bandwidth_reservation.commit();
+    if !tid.is_empty() {
+        let _ = app_handle.emit("upload-progress", ProgressPayload {
+            id: tid, percent: 100, uploaded_bytes: size, total_bytes: size, speed_bytes_per_sec: 0,
+        });
+    }
+
+    if report_message_id {
+        Ok(sent.id().to_string())
+    } else {
+        Ok("File uploaded successfully".to_string())
+    }
+}
+
 /// Core upload implementation shared by the interactive upload command and
 /// the Backup feature's background walker (`commands::backup::run_backup`).
 ///
@@ -1293,8 +1731,21 @@ pub(crate) async fn cmd_upload_file_inner(
         ).await;
     }
 
-    // --- Standard upload path (unchanged) ---
+    // --- Standard upload path ---
     let size = plaintext_size;
+
+    // Files over Telegram's single-message limit get split into multiple
+    // messages with a hidden manifest — see the `split_file` module docs.
+    // Placed after the encrypted-path branch above (which always returns),
+    // so encrypted uploads never reach this check at all; v1 is
+    // plaintext-only by construction, no extra flag needed.
+    if split_file::should_split(size) {
+        return upload_split_file(
+            path, folder_id, transfer_id, app_handle, state,
+            bw_state, net_config, remote_name_override,
+        ).await;
+    }
+
     // RAII reservation prevents quota leaks on every error and cancellation
     // path (including ones that might be added later) — same pattern as
     // `cmd_upload_file_encrypted` below. `commit()` is only called on the
@@ -1319,8 +1770,12 @@ pub(crate) async fn cmd_upload_file_inner(
         });
     }
 
-    // Create progress-tracking reader
-    let (mut reader, file_size, bytes_counter) = ProgressReader::new(&path).await?;
+    // Shared progress counter — the actual reader is (re-)opened fresh per
+    // upload attempt via `ProgressReader::new_range`, same as the split-file
+    // path, so a failed attempt can retry from this file's own start without
+    // needing a reader instance to already exist here.
+    let file_size = size;
+    let bytes_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     // The Backup feature (the only caller that ever sets remote_name_override)
     // needs the new message's id back so it can record it in its ledger and,
     // on overwrite, delete the file's previous message. Every other caller
@@ -1380,8 +1835,25 @@ pub(crate) async fn cmd_upload_file_inner(
     }
 
     let client_clone = client.clone();
+    let reader_path = path.clone();
+    let reader_counter = bytes_counter.clone();
+    let counter_for_retry = bytes_counter.clone();
+    let retry_name = file_name.clone();
+    let max_retries = net_config.retry_attempts();
+    let base_ms = net_config.retry_base_backoff_ms();
+    let max_ms = net_config.retry_max_backoff_ms();
     let mut upload_task = tokio::spawn(async move {
-        client_clone.upload_stream(&mut reader, file_size as usize, file_name).await
+        let attempt = || {
+            let client = client_clone.clone();
+            let path = reader_path.clone();
+            let counter = reader_counter.clone();
+            let name = retry_name.clone();
+            async move {
+                let mut reader = ProgressReader::new_range(&path, 0, file_size, counter).await?;
+                client.upload_stream(&mut reader, file_size as usize, name).await.map_err(map_error)
+            }
+        };
+        upload_with_retry(&counter_for_retry, attempt, max_retries, base_ms, max_ms).await
     });
 
     let upload_result = {
@@ -1404,54 +1876,27 @@ pub(crate) async fn cmd_upload_file_inner(
 
     if let Some(t) = progress_task { t.abort(); }
 
-    let uploaded_file = upload_result.map_err(map_error)?;
+    let uploaded_file = upload_result?;
     let message = InputMessage::new().text("").file(uploaded_file);
 
     let peer = resolve_peer(&client, folder_id, &state.peer_cache).await?;
 
-    let max_retries = net_config.retry_attempts();
-    let base_ms = net_config.retry_base_backoff_ms();
-    let max_ms = net_config.retry_max_backoff_ms();
-    let respect_flood = net_config.should_respect_flood_wait();
-    let mut last_err = String::new();
+    let sent = send_with_retry(
+        &client, &peer, message,
+        net_config.retry_attempts(), net_config.retry_base_backoff_ms(),
+        net_config.retry_max_backoff_ms(), net_config.should_respect_flood_wait(),
+    ).await.map_err(|err| format!("Upload failed: {}", err))?;
 
-    for attempt in 0..=max_retries {
-        match client.send_message(&peer, message.clone()).await {
-            Ok(sent) => {
-        bandwidth_reservation.commit();
-        if !tid.is_empty() {
-            let _ = app_handle.emit("upload-progress", ProgressPayload {
-                id: tid, percent: 100, uploaded_bytes: size, total_bytes: size, speed_bytes_per_sec: 0,
-            });
-        }
-        if report_message_id {
-            return Ok(sent.id().to_string());
-        }
-        return Ok("File uploaded successfully".to_string());
-            }
-            Err(e) => {
-                let err = map_error(e);
-                log::warn!("send_message attempt {}/{}: {}", attempt + 1, max_retries + 1, err);
-                if respect_flood && err.starts_with("FLOOD_WAIT_") {
-                    if let Ok(secs) = err.trim_start_matches("FLOOD_WAIT_").parse::<u64>() {
-                        let wait = secs.min(300);
-                        log::info!("Respecting FLOOD_WAIT: sleeping {}s", wait);
-                        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
-                        last_err = err;
-                        continue;
-                    }
-                }
-                last_err = err;
-                if attempt < max_retries {
-                    let delay = backoff_ms(attempt, base_ms, max_ms);
-                    log::info!("Retrying in {}ms...", delay);
-                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-                }
-            }
-        }
+    bandwidth_reservation.commit();
+    if !tid.is_empty() {
+        let _ = app_handle.emit("upload-progress", ProgressPayload {
+            id: tid, percent: 100, uploaded_bytes: size, total_bytes: size, speed_bytes_per_sec: 0,
+        });
     }
-
-    Err(format!("Upload failed after {} attempts: {}", max_retries + 1, last_err))
+    if report_message_id {
+        return Ok(sent.id().to_string());
+    }
+    Ok("File uploaded successfully".to_string())
 }
 
 /// Encrypted upload path: wraps the file with EncryptingReader, uploads TDENC1 bytes.
@@ -1573,6 +2018,13 @@ async fn cmd_upload_file_encrypted(
         Vec::new()
     };
 
+    // Kept around (all cheap/`Clone`) so a failed upload attempt can rebuild
+    // a byte-identical `EncryptionSession` from scratch and retry, since
+    // `EncryptingReader` can't be rewound once partially consumed.
+    let retry_key_slots = key_slots.clone();
+    let retry_metadata_plaintext = metadata_plaintext.clone();
+    let retry_dek = dek.clone();
+
     // Create encryption session with a protected original name and MIME type.
     let session = EncryptionSession::new_with_keys(
         plaintext_size, key_slots, metadata_plaintext,
@@ -1656,15 +2108,15 @@ async fn cmd_upload_file_encrypted(
         }))
     };
 
-    // Wrap with EncryptingReader
-    let mut encrypting_reader = EncryptingReader::new(reader, session);
-
-    // Extract session info BEFORE the reader is moved into the spawn closure
-    let file_uuid = encrypting_reader.session.file_uuid;
-    let header_bytes_for_registry = encrypting_reader.session.header_bytes.clone();
+    // Extract the one field needed later (for the encrypted-files registry)
+    // before `session` is discarded — every retry attempt below rebuilds an
+    // equivalent session from the same deterministic inputs, so this value
+    // stays correct regardless of which attempt actually succeeds.
+    let header_bytes_for_registry = session.header_bytes.clone();
+    drop(session);
+    drop(reader);
     let b32_name = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&file_uuid);
     let remote_name = format!("tdrive_{}.tdenc", &b32_name[..b32_name.len().min(32)]);
-    let remote_name_for_spawn = remote_name.clone();
 
     // Check cancellation before starting
     if state.cancelled_transfers.read().await.contains(&tid) {
@@ -1679,8 +2131,38 @@ async fn cmd_upload_file_encrypted(
     }
 
     let client_clone = client.clone();
+    let reader_path = path.clone();
+    let reader_counter = bytes_counter.clone();
+    let counter_for_retry = bytes_counter.clone();
+    let retry_name = remote_name.clone();
+    let max_retries = net_config.retry_attempts();
+    let base_ms = net_config.retry_base_backoff_ms();
+    let max_ms = net_config.retry_max_backoff_ms();
     let mut upload_task = tokio::spawn(async move {
-        client_clone.upload_stream(&mut encrypting_reader, ciphertext_size as usize, remote_name_for_spawn).await
+        // Rebuilds the plaintext reader AND the encryption session fresh on
+        // every attempt (including the first) — `EncryptingReader` can't be
+        // rewound once partially consumed, and rebuilding the session here
+        // is cheap (no heavy crypto re-derivation; `key_slots`/`dek` were
+        // already wrapped once, above, this just re-serializes the envelope
+        // header from those same deterministic inputs).
+        let attempt = || {
+            let client = client_clone.clone();
+            let path = reader_path.clone();
+            let counter = reader_counter.clone();
+            let name = retry_name.clone();
+            let key_slots = retry_key_slots.clone();
+            let metadata_plaintext = retry_metadata_plaintext.clone();
+            let dek = retry_dek.clone();
+            async move {
+                let plain_reader = ProgressReader::new_range(&path, 0, plaintext_size, counter).await?;
+                let fresh_session = EncryptionSession::new_with_keys(
+                    plaintext_size, key_slots, metadata_plaintext, dek, file_uuid, nonce_prefix,
+                ).map_err(|e| format!("Failed to build encryption session: {}", e))?;
+                let mut reader = EncryptingReader::new(plain_reader, fresh_session);
+                client.upload_stream(&mut reader, ciphertext_size as usize, name).await.map_err(map_error)
+            }
+        };
+        upload_with_retry(&counter_for_retry, attempt, max_retries, base_ms, max_ms).await
     });
 
     let upload_result = {
@@ -1901,12 +2383,24 @@ pub async fn cmd_rename_file(
     let messages = client.get_messages_by_id(&peer, &[message_id])
         .await
         .map_err(|e| format!("Failed to fetch message for rename: {}", e))?;
-    if messages.iter().flatten().next().is_none() {
+    let Some(existing_message) = messages.into_iter().flatten().next() else {
         return Err(format!(
             "Message {} not found in folder {:?}. The file may have been moved or deleted. Please refresh the folder.",
             message_id, folder_id
         ));
-    }
+    };
+
+    // A split-file manifest's "name" lives inside its JSON, not as a plain
+    // rename target — rebuild the manifest with only `name` changed and
+    // re-serialize it with the marker prefix, so the part messages
+    // themselves are never touched (they carry no display name of their
+    // own to begin with).
+    let message_text = if let Some(manifest) = split_file::parse_manifest(existing_message.text()) {
+        let updated = split_file::SplitManifest { name: new_name, ..manifest };
+        split_file::manifest_text(&updated)?
+    } else {
+        new_name
+    };
 
     let input_peer = match &peer {
         Peer::User(u) => {
@@ -1933,7 +2427,7 @@ pub async fn cmd_rename_file(
         id: message_id,
         no_webpage: false,
         invert_media: false,
-        message: Some(new_name),
+        message: Some(message_text),
         media: None,
         reply_markup: None,
         entities: None,
@@ -1968,14 +2462,29 @@ pub async fn cmd_delete_file(
     let messages = client.get_messages_by_id(&peer, &[message_id])
         .await
         .map_err(|e| format!("Failed to fetch message for delete: {}", e))?;
-    if messages.iter().flatten().next().is_none() {
+    let Some(existing_message) = messages.into_iter().flatten().next() else {
         return Err(format!(
             "Message {} not found in folder {:?}. The file may have already been moved or deleted. Please refresh the folder.",
             message_id, folder_id
         ));
-    }
+    };
 
-    client.delete_messages(&peer, &[message_id]).await.map_err(|e| e.to_string())?;
+    // A split-file manifest represents itself plus every part message — all
+    // of them need deleting together, or the parts would be left as
+    // permanently orphaned (and, since they're hidden by their own marker,
+    // invisible clutter the user has no way to find and clean up).
+    let ids_to_delete: Vec<i32> = match split_file::parse_manifest(existing_message.text()) {
+        Some(manifest) => {
+            let mut ids = manifest.part_ids;
+            ids.push(message_id);
+            ids
+        }
+        None => vec![message_id],
+    };
+
+    for batch in ids_to_delete.chunks(100) {
+        client.delete_messages(&peer, batch).await.map_err(|e| e.to_string())?;
+    }
     let folder_key = folder_id.map(|id| id.to_string()).unwrap_or_else(|| "home".to_string());
     match db_pool.lock() {
         Ok(connection) => {
@@ -2146,90 +2655,251 @@ pub async fn cmd_download_file(
         .next()
         .ok_or_else(|| "Message not found".to_string())?;
 
-    let media = msg.media()
-        .ok_or_else(|| "No media in message".to_string())?;
+    // A split-file manifest (see `split_file` module docs) has no media of
+    // its own — it's a plain text message — so this must be checked before
+    // the `msg.media()` lookup below, which would otherwise error out with
+    // "No media in message" for one.
+    let manifest = split_file::parse_manifest(msg.text());
 
-    let declared_size = media_size(&media);
-    let expected_file_size = (declared_size > 0).then_some(declared_size);
-    let total_size = declared_size;
-    
-    bw_state.try_reserve_down(total_size)?;
+    let (total_size, expected_file_size) = if let Some(ref m) = manifest {
+        (m.size, Some(m.size))
+    } else {
+        let media = msg.media().ok_or_else(|| "No media in message".to_string())?;
+        let declared_size = media_size(&media);
+        (declared_size, (declared_size > 0).then_some(declared_size))
+    };
+
+    // A deterministic (not random) partial-file name, keyed by this
+    // message's id, so a LATER separate download attempt for the same file
+    // can find and resume this exact partial download instead of starting
+    // over — a random name (as `PartialFileGuard` elsewhere uses) could
+    // never be rediscovered by a subsequent attempt. Binding to `message_id`
+    // (not just `actual_save_path`) also means we never accidentally resume
+    // into an unrelated file that happens to already sit at that path.
+    let part_path = format!("{}.{}.tdpart", actual_save_path, message_id);
+    let split_ranges = manifest.as_ref().map(|m| split_file::part_ranges(m.size));
+    let raw_existing_len = existing_partial_download_len(&part_path).await;
+    let target_resume_from = aligned_resume_point(raw_existing_len, total_size, split_ranges.as_deref());
+    let (mut file, mut downloaded) = open_download_file_for_resume(&part_path, target_resume_from).await?;
+    // Only reserve bandwidth for what's actually left to transfer — a
+    // resumed attempt shouldn't burn a fresh reservation for bytes that are
+    // already on disk from a previous attempt.
+    let remaining = total_size.saturating_sub(downloaded);
+    bw_state.try_reserve_down(remaining)?;
+    if downloaded > 0 {
+        log::info!(
+            "Resuming download of message {} from byte {} ({} of {} remaining)",
+            message_id, downloaded, remaining, total_size
+        );
+    }
 
     // Emit start
     if !tid.is_empty() {
+        let percent = if total_size > 0 { ((downloaded as f64 / total_size as f64) * 100.0) as u8 } else { 0 };
         let _ = app_handle.emit("download-progress", ProgressPayload {
-            id: tid.clone(), percent: 0, uploaded_bytes: 0, total_bytes: total_size, speed_bytes_per_sec: 0,
+            id: tid.clone(), percent, uploaded_bytes: downloaded, total_bytes: total_size, speed_bytes_per_sec: 0,
         });
     }
 
-    // Stream download with per-chunk progress
-    let mut download_iter = client.iter_download(&media);
-    let mut file = tokio::fs::File::create(&actual_save_path).await.map_err(|e| {
-        bw_state.release_down(total_size);
-        e.to_string()
-    })?;
-    let mut downloaded: u64 = 0;
     let mut last_emit_time = std::time::Instant::now();
-    let mut last_emit_bytes: u64 = 0;
-    let mut chunk_retry_budget = net_config.retry_attempts();
+    let mut last_emit_bytes: u64 = downloaded;
 
-    while let Some(chunk) = download_iter.next().await.transpose() {
-        // Check cancellation
-        if state.cancelled_transfers.read().await.contains(&tid) {
-            state.cancelled_transfers.write().await.remove(&tid);
-            drop(file);
-            cleanup_partial_file(&actual_save_path);
-            bw_state.release_down(total_size);
-            return Err("Transfer cancelled".to_string());
-        }
+    if let Some(manifest) = manifest {
+        // Reassemble a split file: fetch every part message up front
+        // (batched at ≤100 ids per request) so a missing part fails
+        // clearly before any bytes are written, then stream each part's
+        // media in order into the same open file, sharing `downloaded`
+        // across every part so the flush/sync/size-verify tail below (and
+        // the Android MediaStore copy after it) sees one continuous total
+        // and needs no awareness that this was ever split.
+        let part_messages = split_file::fetch_messages_chunked(&client, &peer, &manifest.part_ids)
+            .await
+            .map_err(|e| {
+                bw_state.release_down(remaining);
+                e
+            })?;
 
-        let bytes = match chunk {
-            Ok(b) => {
-                chunk_retry_budget = net_config.retry_attempts(); // reset on success
-                b
-            },
-            Err(e) => {
-                let err = map_error(&e);
-                if chunk_retry_budget > 0 {
-                    chunk_retry_budget -= 1;
-                    log::warn!("Download chunk error (retries left: {}): {}", chunk_retry_budget, err);
-                    let delay = backoff_ms(0, net_config.retry_base_backoff_ms(), net_config.retry_max_backoff_ms());
-                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-                    continue;
-                }
+        // Map the resume offset (0 for a fresh download) to which part it
+        // falls in — earlier parts are already fully on disk and never need
+        // their `iter_download` reopened at all. `downloaded` was already
+        // computed against these exact `ranges` above (via
+        // `aligned_resume_point`), so `offset_within_part` here is
+        // guaranteed to already be a clean `DOWNLOAD_CDN_ALIGNMENT` multiple
+        // — no further rounding needed before the `skip_chunks` call below.
+        let ranges = split_ranges.expect("split_ranges is Some whenever manifest is Some");
+        let (resume_part_index, offset_within_part) = split_file::locate_offset(&ranges, downloaded);
+
+        for (index, part_message) in part_messages.into_iter().enumerate().skip(resume_part_index) {
+            let Some(part_message) = part_message else {
                 drop(file);
-                cleanup_partial_file(&actual_save_path);
-                bw_state.release_down(total_size);
-                return Err(format!("Download chunk error: {}", err));
+                cleanup_partial_file(&part_path);
+                bw_state.release_down(remaining);
+                return Err(format!(
+                    "Part {}/{} of this file is missing — cannot reassemble it.",
+                    index + 1, manifest.part_count
+                ));
+            };
+            let Some(media) = part_message.media() else {
+                drop(file);
+                cleanup_partial_file(&part_path);
+                bw_state.release_down(remaining);
+                return Err(format!(
+                    "Part {}/{} of this file has no attached data — cannot reassemble it.",
+                    index + 1, manifest.part_count
+                ));
+            };
+
+            let mut download_iter = client.iter_download(&media);
+            // Only the very first part we touch (the one the resume offset
+            // fell inside) needs a mid-part seek; every part after it always
+            // starts fresh from its own beginning.
+            let part_offset = if index == resume_part_index { offset_within_part } else { 0 };
+            if part_offset > 0 {
+                const CHUNK_SIZE: i32 = 65536;
+                download_iter = download_iter.chunk_size(CHUNK_SIZE);
+                download_iter = download_iter.skip_chunks((part_offset / CHUNK_SIZE as u64) as i32);
             }
-        };
-        tokio::io::AsyncWriteExt::write_all(&mut file, &bytes).await.map_err(|e| e.to_string())?;
-        downloaded += bytes.len() as u64;
-        
-        // Time-based progress emission (every 250ms)
-        if !tid.is_empty() {
-            let now = std::time::Instant::now();
-            let dt = now.duration_since(last_emit_time).as_secs_f64();
-            if dt >= 0.25 || downloaded >= total_size {
-                let speed = if dt > 0.0 { ((downloaded - last_emit_bytes) as f64 / dt) as u64 } else { 0 };
-                let percent = if total_size > 0 { ((downloaded as f64 / total_size as f64) * 100.0).min(100.0) as u8 } else { 0 };
-                let _ = app_handle.emit("download-progress", ProgressPayload {
-                    id: tid.clone(), percent, uploaded_bytes: downloaded, total_bytes: total_size, speed_bytes_per_sec: speed,
-                });
-                last_emit_time = now;
-                last_emit_bytes = downloaded;
+            let mut chunk_retry_budget = net_config.retry_attempts();
+
+            while let Some(chunk) = download_iter.next().await.transpose() {
+                if state.cancelled_transfers.read().await.contains(&tid) {
+                    state.cancelled_transfers.write().await.remove(&tid);
+                    drop(file);
+                    cleanup_partial_file(&part_path);
+                    bw_state.release_down(remaining);
+                    return Err("Transfer cancelled".to_string());
+                }
+
+                let bytes = match chunk {
+                    Ok(b) => {
+                        chunk_retry_budget = net_config.retry_attempts();
+                        b
+                    }
+                    Err(e) => {
+                        let err = map_error(&e);
+                        if chunk_retry_budget > 0 {
+                            chunk_retry_budget -= 1;
+                            log::warn!(
+                                "Download chunk error on part {}/{} (retries left: {}): {}",
+                                index + 1, manifest.part_count, chunk_retry_budget, err
+                            );
+                            let delay = backoff_ms(0, net_config.retry_base_backoff_ms(), net_config.retry_max_backoff_ms());
+                            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                            continue;
+                        }
+                        // Retry budget exhausted for this transfer: keep the
+                        // partial file (don't clean it up) so a later
+                        // download attempt for this same message can resume
+                        // from here instead of starting over.
+                        drop(file);
+                        bw_state.release_down(remaining);
+                        return Err(format!(
+                            "Download chunk error on part {}/{}: {}",
+                            index + 1, manifest.part_count, err
+                        ));
+                    }
+                };
+                tokio::io::AsyncWriteExt::write_all(&mut file, &bytes).await.map_err(|e| e.to_string())?;
+                downloaded += bytes.len() as u64;
+
+                if !tid.is_empty() {
+                    let now = std::time::Instant::now();
+                    let dt = now.duration_since(last_emit_time).as_secs_f64();
+                    if dt >= 0.25 || downloaded >= total_size {
+                        let speed = if dt > 0.0 { ((downloaded - last_emit_bytes) as f64 / dt) as u64 } else { 0 };
+                        let percent = if total_size > 0 { ((downloaded as f64 / total_size as f64) * 100.0).min(100.0) as u8 } else { 0 };
+                        let _ = app_handle.emit("download-progress", ProgressPayload {
+                            id: tid.clone(), percent, uploaded_bytes: downloaded, total_bytes: total_size, speed_bytes_per_sec: speed,
+                        });
+                        last_emit_time = now;
+                        last_emit_bytes = downloaded;
+                    }
+                }
+
+                let dl_limit = net_config.download_limit_bytes_per_sec();
+                if dl_limit > 0 {
+                    let elapsed = last_emit_time.elapsed().as_secs_f64().max(0.001);
+                    let current_rate = (downloaded - last_emit_bytes) as f64 / elapsed;
+                    if current_rate > dl_limit as f64 {
+                        let sleep_ms = ((current_rate / dl_limit as f64 - 1.0) * elapsed * 1000.0) as u64;
+                        if sleep_ms > 0 && sleep_ms < 5000 {
+                            tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+                        }
+                    }
+                }
             }
         }
+    } else {
+        let media = msg.media().ok_or_else(|| "No media in message".to_string())?;
 
-        // Bandwidth throttle: if download limit is set, sleep to maintain rate
-        let dl_limit = net_config.download_limit_bytes_per_sec();
-        if dl_limit > 0 {
-            let elapsed = last_emit_time.elapsed().as_secs_f64().max(0.001);
-            let current_rate = (downloaded - last_emit_bytes) as f64 / elapsed;
-            if current_rate > dl_limit as f64 {
-                let sleep_ms = ((current_rate / dl_limit as f64 - 1.0) * elapsed * 1000.0) as u64;
-                if sleep_ms > 0 && sleep_ms < 5000 {
-                    tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+        // Stream download with per-chunk progress
+        let mut download_iter = client.iter_download(&media);
+        if downloaded > 0 {
+            const CHUNK_SIZE: i32 = 65536;
+            download_iter = download_iter.chunk_size(CHUNK_SIZE);
+            download_iter = download_iter.skip_chunks((downloaded / CHUNK_SIZE as u64) as i32);
+        }
+        let mut chunk_retry_budget = net_config.retry_attempts();
+
+        while let Some(chunk) = download_iter.next().await.transpose() {
+            // Check cancellation
+            if state.cancelled_transfers.read().await.contains(&tid) {
+                state.cancelled_transfers.write().await.remove(&tid);
+                drop(file);
+                cleanup_partial_file(&part_path);
+                bw_state.release_down(remaining);
+                return Err("Transfer cancelled".to_string());
+            }
+
+            let bytes = match chunk {
+                Ok(b) => {
+                    chunk_retry_budget = net_config.retry_attempts(); // reset on success
+                    b
+                },
+                Err(e) => {
+                    let err = map_error(&e);
+                    if chunk_retry_budget > 0 {
+                        chunk_retry_budget -= 1;
+                        log::warn!("Download chunk error (retries left: {}): {}", chunk_retry_budget, err);
+                        let delay = backoff_ms(0, net_config.retry_base_backoff_ms(), net_config.retry_max_backoff_ms());
+                        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                        continue;
+                    }
+                    // Retry budget exhausted: keep the partial file so a
+                    // later attempt for this same message can resume.
+                    drop(file);
+                    bw_state.release_down(remaining);
+                    return Err(format!("Download chunk error: {}", err));
+                }
+            };
+            tokio::io::AsyncWriteExt::write_all(&mut file, &bytes).await.map_err(|e| e.to_string())?;
+            downloaded += bytes.len() as u64;
+
+            // Time-based progress emission (every 250ms)
+            if !tid.is_empty() {
+                let now = std::time::Instant::now();
+                let dt = now.duration_since(last_emit_time).as_secs_f64();
+                if dt >= 0.25 || downloaded >= total_size {
+                    let speed = if dt > 0.0 { ((downloaded - last_emit_bytes) as f64 / dt) as u64 } else { 0 };
+                    let percent = if total_size > 0 { ((downloaded as f64 / total_size as f64) * 100.0).min(100.0) as u8 } else { 0 };
+                    let _ = app_handle.emit("download-progress", ProgressPayload {
+                        id: tid.clone(), percent, uploaded_bytes: downloaded, total_bytes: total_size, speed_bytes_per_sec: speed,
+                    });
+                    last_emit_time = now;
+                    last_emit_bytes = downloaded;
+                }
+            }
+
+            // Bandwidth throttle: if download limit is set, sleep to maintain rate
+            let dl_limit = net_config.download_limit_bytes_per_sec();
+            if dl_limit > 0 {
+                let elapsed = last_emit_time.elapsed().as_secs_f64().max(0.001);
+                let current_rate = (downloaded - last_emit_bytes) as f64 / elapsed;
+                if current_rate > dl_limit as f64 {
+                    let sleep_ms = ((current_rate / dl_limit as f64 - 1.0) * elapsed * 1000.0) as u64;
+                    if sleep_ms > 0 && sleep_ms < 5000 {
+                        tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+                    }
                 }
             }
         }
@@ -2238,30 +2908,36 @@ pub async fn cmd_download_file(
     // Explicitly flush, sync, and close the file before JNI/MediaStore copies it.
     if let Err(e) = tokio::io::AsyncWriteExt::flush(&mut file).await {
         drop(file);
-        cleanup_partial_file(&actual_save_path);
-        bw_state.release_down(total_size);
+        bw_state.release_down(remaining);
         return Err(format!("Failed to flush downloaded file: {}", e));
     }
     if let Err(e) = file.sync_all().await {
         drop(file);
-        cleanup_partial_file(&actual_save_path);
-        bw_state.release_down(total_size);
+        bw_state.release_down(remaining);
         return Err(format!("Failed to sync downloaded file: {}", e));
     }
     drop(file);
 
-    let actual_written = tokio::fs::metadata(&actual_save_path)
+    // All integrity checks run against `part_path` (the file actually
+    // written above) — it's only renamed to `actual_save_path` once every
+    // check has passed, matching the rename-on-success convention
+    // `cmd_download_encrypted_file`'s `PartialFileGuard` already uses.
+    // Every failure branch below deletes `part_path` rather than leaving it
+    // for a future resume, since these are integrity failures (unexpected
+    // size, wrong total), not network transience — resuming from
+    // possibly-corrupt data would just repeat the same failure.
+    let actual_written = tokio::fs::metadata(&part_path)
         .await
         .map_err(|e| format!("Downloaded file missing before save: {}", e))?
         .len();
     if actual_written == 0 {
-        cleanup_partial_file(&actual_save_path);
-        bw_state.release_down(total_size);
+        cleanup_partial_file(&part_path);
+        bw_state.release_down(remaining);
         return Err("Downloaded file was empty before saving".to_string());
     }
     if actual_written != downloaded {
-        cleanup_partial_file(&actual_save_path);
-        bw_state.release_down(total_size);
+        cleanup_partial_file(&part_path);
+        bw_state.release_down(remaining);
         return Err(format!(
             "Downloaded file size mismatch before saving: streamed {} bytes, file has {} bytes",
             downloaded, actual_written
@@ -2269,13 +2945,17 @@ pub async fn cmd_download_file(
     }
     if let Some(expected) = expected_file_size {
         if expected > 0 && downloaded != expected {
-            cleanup_partial_file(&actual_save_path);
-            bw_state.release_down(total_size);
+            cleanup_partial_file(&part_path);
+            bw_state.release_down(remaining);
             return Err(format!(
                 "Incomplete download before saving: expected {} bytes, received {} bytes",
                 expected, downloaded
             ));
         }
+    }
+    if let Err(e) = tokio::fs::rename(&part_path, &actual_save_path).await {
+        bw_state.release_down(remaining);
+        return Err(format!("Failed to finalize downloaded file: {}", e));
     }
     log::info!(
         "Download completed to cache path {} ({} bytes)",
@@ -2364,7 +3044,7 @@ pub async fn cmd_download_file(
         if !jni_success {
             // Keep the cache file as a fallback so the user's data is not lost
             log::error!("JNI: Failed to copy to public downloads. Cache file preserved at: {}", actual_save_path);
-            bw_state.release_down(total_size);
+            bw_state.release_down(remaining);
             return Err("Failed to save downloaded file to public downloads folder".to_string());
         }
         
@@ -2676,6 +3356,20 @@ pub async fn cmd_move_files(
     let source_peer = resolve_peer(&client, source_folder_id, &state.peer_cache).await?;
     let target_peer = resolve_peer(&client, target_folder_id, &state.peer_cache).await?;
 
+    // Split files aren't supported by this move primitive: forwarding
+    // creates new message ids at the destination, so a manifest's
+    // `part_ids` would need rewriting after the forward, with rollback on
+    // partial failure — a correctness-sensitive feature of its own, not a
+    // small addition. Reject clearly up front rather than silently moving
+    // only some of a file's messages.
+    let messages_to_move = split_file::fetch_messages_chunked(&client, &source_peer, &message_ids).await?;
+    if messages_to_move.iter().flatten().any(|m| split_file::parse_manifest(m.text()).is_some()) {
+        return Err(
+            "[SPLIT_MOVE_UNSUPPORTED] Moving a split (over 2GB) file between folders isn't supported yet. Download it and re-upload it in the destination folder instead."
+                .to_string(),
+        );
+    }
+
     let forwarded = match client.forward_messages(&target_peer, &message_ids, &source_peer).await {
         Ok(messages) => messages,
         Err(e) => return Err(format!("Forward failed: {}", e)),
@@ -2816,7 +3510,9 @@ pub async fn cmd_get_files(
         // they're bookkeeping, not user files, so they must never show up
         // in the file list itself.
         let caption = msg.text();
-        if caption == AUDIT_LOG_MARKER || caption == CATALOG_MARKER || caption == JOBS_MARKER {
+        if caption == AUDIT_LOG_MARKER || caption == CATALOG_MARKER || caption == JOBS_MARKER
+            || split_file::is_split_part(caption)
+        {
             continue;
         }
 
@@ -2961,6 +3657,42 @@ pub async fn cmd_get_files(
                     break;
                 }
             }
+        } else if let Some(manifest) = split_file::parse_manifest(caption) {
+            // A split-file manifest (see `split_file` module docs) — a
+            // plain text message, so it never has `msg.media()` and falls
+            // through the branch above. Render it as the single logical
+            // file it represents; its part messages were already skipped
+            // above by the `is_split_part` check.
+            let ext = std::path::Path::new(&manifest.name)
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(str::to_string);
+            chunk.push(FileMetadata {
+                id: msg.id() as i64, folder_id, name: manifest.name, size: manifest.size,
+                mime_type: None, file_ext: ext,
+                created_at: msg.date().to_string(), icon_type: "file".into(),
+                encryption_state: "plain".to_string(),
+            });
+
+            if chunk.len() >= 500 {
+                #[derive(Clone, serde::Serialize)]
+                struct FolderLoadPayload {
+                    #[serde(rename = "folderId")]
+                    folder_id: Option<i64>,
+                    files: Vec<FileMetadata>,
+                }
+                let _ = app_handle.emit("folder-load-chunk", FolderLoadPayload {
+                    folder_id,
+                    files: chunk.clone(),
+                });
+
+                safety_counter += chunk.len();
+                chunk.clear();
+
+                if safety_counter >= MAX_FILES_LIMIT {
+                    break;
+                }
+            }
         }
     }
 
@@ -2985,7 +3717,9 @@ fn extract_search_files(msgs: &[tl::enums::Message]) -> Vec<FileMetadata> {
     let mut files = Vec::new();
     for msg in msgs {
         if let tl::enums::Message::Message(m) = msg {
-            if m.message == AUDIT_LOG_MARKER || m.message == CATALOG_MARKER || m.message == JOBS_MARKER {
+            if m.message == AUDIT_LOG_MARKER || m.message == CATALOG_MARKER || m.message == JOBS_MARKER
+                || split_file::is_split_part(&m.message)
+            {
                 continue;
             }
             if let Some(tl::enums::MessageMedia::Document(d)) = &m.media {
@@ -3604,9 +4338,12 @@ pub async fn cmd_upload_from_url(
     let temp_dir = std::env::temp_dir();
 
     if let Some(sz) = known_size {
-        if sz > 2_147_483_648 {
-            return Err("Exceeds 2GB Telegram limit.".into());
-        }
+        // No Telegram-specific size gate here anymore — files over the
+        // per-message limit now get split automatically by
+        // `cmd_upload_file_inner` (see the `split_file` module). The disk
+        // free-space check right below is what actually protects against
+        // an oversized/malicious URL filling the disk, independent of any
+        // Telegram-specific number.
         let free_space = tokio::task::spawn_blocking({
             let temp_dir = temp_dir.clone();
             move || {
@@ -3797,13 +4534,6 @@ pub async fn cmd_upload_from_url(
             }
             downloaded += chunk.len() as u64;
 
-            // Dynamic 2GB check when total size is unknown
-            if known_size.is_none() && downloaded > 2_147_483_648 {
-                drop(file);
-                let _ = tokio::fs::remove_file(&temp_file_path).await;
-                return Err("Downloaded file exceeds 2GB Telegram limit.".to_string());
-            }
-
             let now = std::time::Instant::now();
             let dt = now.duration_since(last_emit_time).as_secs_f64();
             let emit_total = known_size.unwrap_or(downloaded);
@@ -3875,10 +4605,9 @@ pub async fn cmd_upload_from_url(
         return Err("Downloaded file is empty".to_string());
     }
 
-    if actual_size > 2_147_483_648 {
-        let _ = tokio::fs::remove_file(&temp_file_path).await;
-        return Err("Downloaded file exceeds 2GB Telegram limit.".to_string());
-    }
+    // No Telegram-specific size gate here anymore — files over the
+    // per-message limit now get split automatically by
+    // `cmd_upload_file_inner` (see the `split_file` module).
 
     // Remote uploads must preserve the same protection intent as every other
     // upload origin. Stage the downloaded file under its logical server name so
@@ -3967,7 +4696,7 @@ pub async fn cmd_upload_from_url(
         total_bytes: actual_size,
     });
 
-    let (mut reader, file_size, bytes_counter) = match ProgressReader::new(&temp_file_str).await {
+    let (reader, file_size, bytes_counter) = match ProgressReader::new(&temp_file_str).await {
         Ok(res) => res,
         Err(e) => {
             bw_state.release_up(actual_size);
@@ -4019,6 +4748,11 @@ pub async fn cmd_upload_from_url(
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
     get_upload_cancellations().lock().unwrap().insert(transfer_id.clone(), cancel_tx);
 
+    // `reader` (opened once above just to learn `file_size`/`bytes_counter`)
+    // is discarded — every upload attempt below opens its own fresh reader
+    // from `temp_file_str`'s own start, so a failed attempt can retry
+    // without needing this specific reader instance to still be valid.
+    drop(reader);
     let client_clone = client.clone();
     let file_name = server_filename.unwrap_or_else(|| {
         reqwest::Url::parse(&url)
@@ -4031,9 +4765,26 @@ pub async fn cmd_upload_from_url(
             })
             .unwrap_or_else(|| "remote_file".to_string())
     });
-    
+    let reader_path = temp_file_str.clone();
+    let reader_counter = bytes_counter.clone();
+    let counter_for_retry = bytes_counter.clone();
+    let retry_name = file_name.clone();
+    let max_retries = net_config.retry_attempts();
+    let base_ms = net_config.retry_base_backoff_ms();
+    let max_ms = net_config.retry_max_backoff_ms();
+
     let mut upload_task = tokio::spawn(async move {
-        client_clone.upload_stream(&mut reader, file_size as usize, file_name).await
+        let attempt = || {
+            let client = client_clone.clone();
+            let path = reader_path.clone();
+            let counter = reader_counter.clone();
+            let name = retry_name.clone();
+            async move {
+                let mut reader = ProgressReader::new_range(&path, 0, file_size, counter).await?;
+                client.upload_stream(&mut reader, file_size as usize, name).await.map_err(map_error)
+            }
+        };
+        upload_with_retry(&counter_for_retry, attempt, max_retries, base_ms, max_ms).await
     });
 
     let uploaded_file = {
@@ -4046,7 +4797,7 @@ pub async fn cmd_upload_from_url(
                         bw_state.release_up(actual_size);
                         progress_task.abort();
                         let _ = tokio::fs::remove_file(&temp_file_path).await;
-                        return Err(map_error(e));
+                        return Err(e);
                     }
                     Err(e) => {
                         bw_state.release_up(actual_size);

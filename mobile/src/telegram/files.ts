@@ -20,6 +20,14 @@ export interface TelegramFile {
 
 const PAGE_SIZE = 50;
 
+// Desktop splits files over Telegram's 2GB per-message limit into multiple
+// part messages plus one text-only manifest message (see
+// app/src-tauri/src/split_file.rs — same markers). The manifest is a plain
+// text message, so it never matches toTelegramFile below and is already
+// hidden; only the part documents need filtering out here, or they'd show
+// up as duplicate, raw-caption-named junk.
+const SPLIT_PART_MARKER = "[TD-SPLIT-PART]";
+
 // Matches desktop's convention (extract_search_files in fs.rs): the message
 // caption is the canonical display name when present, ahead of the
 // document's own filename attribute.
@@ -82,6 +90,9 @@ function fromVideoMessage(message: any): TelegramFile | null {
 }
 
 function toTelegramFile(message: any): TelegramFile | null {
+  const caption = message.content?.caption?.text;
+  if (typeof caption === "string" && caption.startsWith(SPLIT_PART_MARKER)) return null;
+
   const type = message.content?.["@type"];
   if (type === "messageDocument") return fromDocumentMessage(message);
   if (type === "messagePhoto") return fromPhotoMessage(message);

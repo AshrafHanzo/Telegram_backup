@@ -1,3 +1,20 @@
+## [3.0.0] - 2026-08-17
+
+### Large File Support
+
+- Files larger than Telegram's 2GB per-message limit now upload automatically as multiple hidden parts plus one manifest message, and download back as a single reassembled file — no manual splitting, no visible part clutter in the file list or search.
+- Added HTTP Range support for split-file downloads through a "Generate Temp Link" share, so browsers and download managers can resume or seek them.
+
+### Resumable Transfers
+
+- Uploads now retry a failed part/file from its own start (with backoff) instead of aborting the whole transfer on a transient network error.
+- Downloads now resume from where they left off on a retry instead of restarting from byte zero, using a deterministic partial-file marker.
+
+### Temp Link Sharing
+
+- Redesigned the shared-folder page to match the desktop app's own look: a real file grid with Telegram-fetched thumbnails and type icons instead of a plain table.
+- Replaced the plain upload form (which used to dump raw JSON on the page after a successful upload) with a proper JavaScript-driven upload flow showing per-file and overall progress, live speed, remaining time, and elapsed time.
+
 ## [2.3.1] - 2026-08-13
 
 ### Fixes
