@@ -36,7 +36,15 @@ type PeerCache = Arc<RwLock<HashMap<i64, Peer>>>;
 
 pub(crate) const CATALOG_MARKER: &str = "[TD-CATALOG]";
 pub(crate) const JOBS_MARKER: &str = "[TD-REMOTE-JOBS]";
+/// Desktop → mobile: the live folder-share list plus the current public base
+/// URL. Written only by desktop (mobile requests changes through the job
+/// queue), so unlike the jobs blob this one has a single writer.
+pub(crate) const SHARES_MARKER: &str = "[TD-SHARES]";
 const SCAN_LIMIT: usize = 300;
+/// How long a completed/failed job stays in the shared blob before being
+/// pruned. Long enough that mobile (which only re-reads on screen open or
+/// pull-to-refresh) reliably sees the outcome of what it submitted.
+const SETTLED_JOB_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
 const MAX_ENTRIES_PER_SOURCE: usize = 2000;
 const COVER_MAX_DIMENSION: u32 = 48;
 const COVER_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "gif", "webp", "bmp"];
@@ -97,6 +105,113 @@ pub enum RemoteJobAction {
         dest_source_id: String,
         dest_folder_path: String,
     },
+    /// Mobile asking desktop to create a real "Temp Link" folder share.
+    /// Mobile can't serve a link itself (no HTTP server, no tunnel, and the
+    /// OS suspends background apps), and desktop resolves share tokens only
+    /// from its own SQLite — so the share has to be created here.
+    ///
+    /// `share_id` is minted by MOBILE, not desktop. That's what makes this
+    /// job idempotent: the jobs blob is whole-file last-write-wins with no
+    /// locking (see `save_jobs`' note below), so a stale mobile write can
+    /// re-present an already-completed job as pending. Keying on a
+    /// caller-supplied token means a re-run is a no-op instead of minting a
+    /// second live share for the same request.
+    ///
+    /// `password_hash` is already bcrypt-hashed by the phone — plaintext
+    /// must never enter this blob, which lives indefinitely in Saved
+    /// Messages. `expires_at` is absolute rather than a duration so a PC
+    /// that was offline for days doesn't silently extend the window.
+    CreateFolderShare {
+        share_id: String,
+        /// Raw channel id (`Peer::Channel(c) => c.raw.id`), NOT a TDLib
+        /// `-100…` chat id — mobile must send `supergroupId`. `None` means
+        /// Saved Messages, matching `resolve_peer`.
+        folder_id: Option<i64>,
+        folder_name: String,
+        can_upload: bool,
+        can_download: bool,
+        can_update: bool,
+        can_delete: bool,
+        #[serde(default)]
+        username: Option<String>,
+        #[serde(default)]
+        password_hash: Option<String>,
+        #[serde(default)]
+        expires_at: Option<i64>,
+    },
+    /// Revoking is already idempotent (a plain `UPDATE … SET revoked = 1`),
+    /// so it needs no extra guard.
+    RevokeFolderShare { share_id: String },
+}
+
+/// What desktop publishes for mobile under `SHARES_MARKER`. Deliberately
+/// carries the live tunnel base URL rather than pre-built links, because the
+/// host changes underneath us (see `publish_shares_to_telegram`).
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SharePublication {
+    /// False when no public tunnel is up — `base_url` is then loopback and
+    /// unusable from another device.
+    pub public: bool,
+    pub base_url: String,
+    pub updated_at: i64,
+    pub shares: Vec<PublishedShare>,
+}
+
+/// One share as mobile sees it. Carries the raw `permissions` bitfield
+/// (bit-compatible with `SharePermissions`) rather than four booleans so it
+/// matches what mobile already mirrors in `SharePermissionBits`. No password
+/// material is ever published — only whether one is set.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PublishedShare {
+    pub id: String,
+    pub folder_id: Option<i64>,
+    pub folder_name: String,
+    pub permissions: i64,
+    pub has_password: bool,
+    pub username: Option<String>,
+    pub expires_at: Option<i64>,
+    pub created_at: i64,
+}
+
+/// A share token becomes a public URL path segment and a database primary
+/// key, so a mobile-supplied one is validated rather than trusted: exactly
+/// the 32 lowercase hex characters `generate_share_token` produces.
+fn validate_share_token(token: &str) -> Result<(), String> {
+    let well_formed = token.len() == 32
+        && token
+            .chars()
+            .all(|character| character.is_ascii_digit() || ('a'..='f').contains(&character));
+    if well_formed {
+        Ok(())
+    } else {
+        Err("Share id must be 32 lowercase hexadecimal characters".to_string())
+    }
+}
+
+/// The phone hashes share passwords itself (plaintext must never enter the
+/// jobs blob, which lives indefinitely in Saved Messages), so the hash
+/// arrives pre-computed and is fed straight to `verify_password` later. The
+/// cost is capped because verification time is exponential in it — an
+/// absurd cost would turn every link visit into a CPU stall.
+fn validate_bcrypt_hash(hash: &str) -> Result<(), String> {
+    let rest = hash
+        .strip_prefix("$2a$")
+        .or_else(|| hash.strip_prefix("$2b$"))
+        .or_else(|| hash.strip_prefix("$2y$"))
+        .ok_or_else(|| "Password hash is not a bcrypt hash".to_string())?;
+    let (cost, remainder) = rest
+        .split_once('$')
+        .ok_or_else(|| "Malformed bcrypt hash: missing cost separator".to_string())?;
+    let cost: u32 = cost
+        .parse()
+        .map_err(|_| "Malformed bcrypt hash: unreadable cost".to_string())?;
+    if !(4..=14).contains(&cost) {
+        return Err(format!("Unsupported bcrypt cost {} (expected 4-14)", cost));
+    }
+    if remainder.len() < 53 {
+        return Err("Malformed bcrypt hash: truncated".to_string());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -474,6 +589,71 @@ pub async fn sync_catalog_to_telegram(
     publish_json(app, client, &peer, CATALOG_MARKER, "backup-catalog.json", &json_bytes).await
 }
 
+/// Publishes the desktop's current folder shares for mobile to read.
+///
+/// Mobile can't derive a link itself: the Cloudflare quick-tunnel host is
+/// random and changes not only on every desktop restart but mid-session too
+/// (`tunnel.rs` clears it when cloudflared exits and gets a fresh one on
+/// respawn). So this carries the live `base_url` alongside each share's
+/// stable token, and mobile composes `base_url + /s/ + token` at display
+/// time — the same "token is identity, URL is derived" rule
+/// `cmd_list_folder_shares` follows.
+///
+/// `public` is false when no tunnel is up, in which case `base_url` is the
+/// loopback fallback and is useless to a phone — mobile shows a "waiting for
+/// your PC's public link" state rather than a link that cannot work.
+pub async fn publish_shares_to_telegram(
+    app: &AppHandle,
+    client: &Client,
+    peer_cache: &PeerCache,
+) -> Result<(), String> {
+    let tunnel_base = app
+        .try_state::<std::sync::Arc<crate::tunnel::TunnelState>>()
+        .and_then(|state| state.base_url());
+    let publication = SharePublication {
+        public: tunnel_base.is_some(),
+        base_url: tunnel_base
+            .unwrap_or_else(|| format!("http://127.0.0.1:{}", crate::STREAM_PORT)),
+        updated_at: chrono::Utc::now().timestamp(),
+        shares: load_shares_for_publication(&app.state::<DbConnection>())?,
+    };
+
+    let json_bytes = serde_json::to_vec(&publication).map_err(|e| e.to_string())?;
+    let peer = resolve_peer(client, None, peer_cache).await?;
+    publish_json(app, client, &peer, SHARES_MARKER, "folder-shares.json", &json_bytes).await
+}
+
+/// Reads every live share straight from the same table the HTTP routes
+/// serve from, so mobile can never show a link desktop wouldn't honour.
+fn load_shares_for_publication(db_pool: &DbConnection) -> Result<Vec<PublishedShare>, String> {
+    let conn = db_pool.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, folder_id, folder_name, permissions, password_hash, username, expires_at, created_at
+             FROM folder_shares WHERE revoked = 0 ORDER BY created_at DESC",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let mut shares = Vec::new();
+    while let sqlite::State::Row = stmt.next().map_err(|e| e.to_string())? {
+        shares.push(PublishedShare {
+            id: stmt.read::<String, _>("id").map_err(|e| e.to_string())?,
+            folder_id: stmt.read::<Option<i64>, _>("folder_id").ok().flatten(),
+            folder_name: stmt.read::<String, _>("folder_name").map_err(|e| e.to_string())?,
+            permissions: stmt.read::<i64, _>("permissions").map_err(|e| e.to_string())?,
+            has_password: stmt
+                .read::<Option<String>, _>("password_hash")
+                .ok()
+                .flatten()
+                .is_some(),
+            username: stmt.read::<Option<String>, _>("username").ok().flatten(),
+            expires_at: stmt.read::<Option<i64>, _>("expires_at").ok().flatten(),
+            created_at: stmt.read::<i64, _>("created_at").map_err(|e| e.to_string())?,
+        });
+    }
+    Ok(shares)
+}
+
 async fn load_jobs(client: &Client, peer: &Peer) -> Result<Vec<RemoteJob>, String> {
     load_json_from_marker(client, peer, JOBS_MARKER).await
 }
@@ -515,6 +695,11 @@ pub async fn process_pending_jobs_once(
         return Ok(());
     }
 
+    // Set by the share job arms so the `[TD-SHARES]` blob only gets
+    // republished when something actually changed — every publish costs an
+    // upload plus a delete in Saved Messages.
+    let mut shares_changed = false;
+
     for job in &mut jobs {
         if job.status != RemoteJobStatus::Pending {
             continue;
@@ -549,6 +734,59 @@ pub async fn process_pending_jobs_once(
                     app, source_id, relative_path, dest_source_id, dest_folder_path, true,
                 );
                 (outcome, format!("Remote job: move \"{}\" to \"{}\"", relative_path, dest_folder_path))
+            }
+            RemoteJobAction::CreateFolderShare {
+                share_id, folder_id, folder_name,
+                can_upload, can_download, can_update, can_delete,
+                username, password_hash, expires_at,
+            } => {
+                let detail = format!("Remote job: create share link for \"{}\"", folder_name);
+                let outcome = async {
+                    validate_share_token(share_id)?;
+                    if let Some(hash) = password_hash {
+                        validate_bcrypt_hash(hash)?;
+                    }
+                    // Resolve the folder BEFORE inserting, so a wrong or
+                    // unreachable id fails the job with a readable error
+                    // instead of minting a token that 500s on every request
+                    // forever. Mobile must send the raw channel id
+                    // (`supergroupId`), not a TDLib `-100…` chat id — that
+                    // mismatch is exactly what made its old share path dead.
+                    resolve_peer(client, *folder_id, peer_cache)
+                        .await
+                        .map_err(|error| format!("Folder \"{}\" is not reachable: {}", folder_name, error))?;
+                    crate::commands::sharing::create_folder_share_inner(
+                        crate::commands::sharing::CreateFolderShareParams {
+                            share_id: Some(share_id.clone()),
+                            folder_id: *folder_id,
+                            folder_name: folder_name.clone(),
+                            can_upload: *can_upload,
+                            can_download: *can_download,
+                            can_update: *can_update,
+                            can_delete: *can_delete,
+                            username: username.clone(),
+                            password_hash: password_hash.clone(),
+                            expires_at: *expires_at,
+                        },
+                        db_pool,
+                        app,
+                    )
+                    .map(|_| ())
+                }
+                .await;
+                if outcome.is_ok() {
+                    shares_changed = true;
+                }
+                (outcome, detail)
+            }
+            RemoteJobAction::RevokeFolderShare { share_id } => {
+                let outcome = validate_share_token(share_id).and_then(|()| {
+                    crate::commands::sharing::revoke_folder_share_inner(share_id, db_pool)
+                });
+                if outcome.is_ok() {
+                    shares_changed = true;
+                }
+                (outcome, format!("Remote job: revoke share link {}", share_id))
             }
         };
 
@@ -594,8 +832,169 @@ pub async fn process_pending_jobs_once(
         }
     }
 
+    // Nothing ever pruned this list before, so it grew without bound — and
+    // every read pays for it, since the whole blob is downloaded each time.
+    // Settled jobs older than the retention window are dropped; pending ones
+    // are always kept regardless of age, since a job can legitimately sit
+    // unclaimed for a long time while the desktop app is closed.
+    let prune_before = chrono::Utc::now().timestamp() - SETTLED_JOB_RETENTION_SECS;
+    jobs.retain(|job| {
+        job.status == RemoteJobStatus::Pending
+            || job.completed_at.unwrap_or(job.created_at) >= prune_before
+    });
+
     save_jobs(app, client, &peer, &jobs).await?;
     // The set of sources may have changed — keep the catalog in step.
     let _ = sync_catalog_to_telegram(app, client, peer_cache).await;
+    // Only republish the share list when a share job actually ran, so an
+    // ordinary backup job doesn't pay for an extra upload+delete round trip.
+    if shares_changed {
+        let _ = publish_shares_to_telegram(app, client, peer_cache).await;
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn share_token_validation_accepts_only_generated_shape() {
+        assert!(validate_share_token(&"a1b2c3d4e5f60718293a4b5c6d7e8f90".to_string()).is_ok());
+        // Wrong length, uppercase, non-hex, and path-traversal attempts all
+        // have to be rejected — this value becomes a URL segment and a
+        // primary key.
+        assert!(validate_share_token("tooshort").is_err());
+        assert!(validate_share_token("A1B2C3D4E5F60718293A4B5C6D7E8F90").is_err());
+        assert!(validate_share_token("../../etc/passwd").is_err());
+        assert!(validate_share_token("a1b2c3d4e5f60718293a4b5c6d7e8f9").is_err());
+    }
+
+    #[test]
+    fn bcrypt_hash_validation_accepts_real_hashes_and_rejects_junk() {
+        // A genuine cost-12 hash (the cost desktop itself uses).
+        let real = "$2b$12$C6UzMDM.H6dfI/f/IKcEe.7ZUwNJ4hEuMPuTsjnKpEHkqXPHmVUqO";
+        assert!(validate_bcrypt_hash(real).is_ok());
+        // Plaintext leaking through instead of a hash is the failure this
+        // guard exists to catch.
+        assert!(validate_bcrypt_hash("hunter2").is_err());
+        assert!(validate_bcrypt_hash("$1$oldmd5$whatever").is_err());
+        assert!(validate_bcrypt_hash("$2b$12$tooshort").is_err());
+    }
+
+    #[test]
+    fn bcrypt_cost_is_capped_so_verification_cannot_stall_the_server() {
+        let padding = "C6UzMDM.H6dfI/f/IKcEe.7ZUwNJ4hEuMPuTsjnKpEHkqXPHmVUqO";
+        assert!(validate_bcrypt_hash(&format!("$2b$31${}", padding)).is_err());
+        assert!(validate_bcrypt_hash(&format!("$2b$03${}", padding)).is_err());
+        assert!(validate_bcrypt_hash(&format!("$2b$14${}", padding)).is_ok());
+    }
+
+    #[test]
+    fn create_share_action_round_trips_through_json() {
+        let action = RemoteJobAction::CreateFolderShare {
+            share_id: "a1b2c3d4e5f60718293a4b5c6d7e8f90".to_string(),
+            folder_id: Some(4336115350),
+            folder_name: "Iceland 2026".to_string(),
+            can_upload: true,
+            can_download: true,
+            can_update: false,
+            can_delete: false,
+            username: None,
+            password_hash: Some("$2b$12$abc".to_string()),
+            expires_at: Some(1_800_000_000),
+        };
+        let json = serde_json::to_string(&action).expect("serializes");
+        assert!(json.contains(r#""type":"create_folder_share""#));
+        match serde_json::from_str::<RemoteJobAction>(&json).expect("deserializes") {
+            RemoteJobAction::CreateFolderShare { share_id, folder_id, expires_at, .. } => {
+                assert_eq!(share_id, "a1b2c3d4e5f60718293a4b5c6d7e8f90");
+                assert_eq!(folder_id, Some(4336115350));
+                assert_eq!(expires_at, Some(1_800_000_000));
+            }
+            other => panic!("wrong variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn revoke_share_action_round_trips_through_json() {
+        let action = RemoteJobAction::RevokeFolderShare {
+            share_id: "a1b2c3d4e5f60718293a4b5c6d7e8f90".to_string(),
+        };
+        let json = serde_json::to_string(&action).expect("serializes");
+        assert!(json.contains(r#""type":"revoke_folder_share""#));
+        assert!(matches!(
+            serde_json::from_str::<RemoteJobAction>(&json).expect("deserializes"),
+            RemoteJobAction::RevokeFolderShare { .. }
+        ));
+    }
+
+    #[test]
+    fn optional_share_fields_may_be_absent_for_forward_compatibility() {
+        // A phone on an older build omits the optional keys entirely; the
+        // `#[serde(default)]` attributes must let that still parse rather
+        // than failing the whole blob (which would strand every job in it).
+        let json = r#"{
+            "type": "create_folder_share",
+            "share_id": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+            "folder_id": null,
+            "folder_name": "Saved Messages",
+            "can_upload": false,
+            "can_download": true,
+            "can_update": false,
+            "can_delete": false
+        }"#;
+        match serde_json::from_str::<RemoteJobAction>(json).expect("parses without optional keys") {
+            RemoteJobAction::CreateFolderShare { username, password_hash, expires_at, .. } => {
+                assert!(username.is_none());
+                assert!(password_hash.is_none());
+                assert!(expires_at.is_none());
+            }
+            other => panic!("wrong variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn existing_job_json_still_parses_after_adding_the_new_variants() {
+        // Blobs already sitting in Saved Messages were written before this
+        // change; adding enum variants must not break reading them.
+        let json = r#"[{
+            "id": "job-1",
+            "action": { "type": "remove_source", "source_id": "src-9" },
+            "status": "completed",
+            "error": null,
+            "created_at": 1786000000,
+            "completed_at": 1786000060
+        }]"#;
+        let jobs: Vec<RemoteJob> = serde_json::from_str(json).expect("legacy blob parses");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].status, RemoteJobStatus::Completed);
+    }
+
+    #[test]
+    fn share_publication_round_trips_with_the_fields_mobile_reads() {
+        let publication = SharePublication {
+            public: true,
+            base_url: "https://random-words.trycloudflare.com".to_string(),
+            updated_at: 1_786_000_000,
+            shares: vec![PublishedShare {
+                id: "a1b2c3d4e5f60718293a4b5c6d7e8f90".to_string(),
+                folder_id: Some(42),
+                folder_name: "Iceland 2026".to_string(),
+                permissions: 0b0011,
+                has_password: true,
+                username: None,
+                expires_at: None,
+                created_at: 1_786_000_000,
+            }],
+        };
+        let json = serde_json::to_string(&publication).expect("serializes");
+        let parsed: SharePublication = serde_json::from_str(&json).expect("deserializes");
+        assert!(parsed.public);
+        assert_eq!(parsed.shares.len(), 1);
+        assert_eq!(parsed.shares[0].permissions, 0b0011);
+        // Password material must never appear in what mobile receives.
+        assert!(!json.contains("password_hash"));
+        assert!(!json.contains("$2b$"));
+    }
 }

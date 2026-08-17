@@ -576,6 +576,42 @@ fn cmd_get_system_diagnostics(
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+/// Drains any jobs mobile left for this device (share-link requests, backup
+/// source changes) when the main window regains focus.
+///
+/// Guarded so overlapping focus events can't double-execute a job, and it
+/// re-reads the Telegram client from state on every run rather than capturing
+/// a handle — reconnects and logout replace the client and kill the old one's
+/// runner, so a cached clone would be permanently dead.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn drain_remote_jobs_on_focus(app: tauri::AppHandle) {
+    use std::sync::atomic::Ordering;
+
+    let state = app.state::<TelegramState>();
+    if state.remote_jobs_running.swap(true, Ordering::SeqCst) {
+        return; // A drain is already in flight.
+    }
+
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<TelegramState>();
+        let client = { state.client.lock().await.clone() };
+        if let Some(client) = client {
+            let db_pool = app.state::<db::DbConnection>();
+            if let Err(error) = remote_catalog::process_pending_jobs_once(
+                &app,
+                &client,
+                &db_pool,
+                &state.peer_cache,
+            )
+            .await
+            {
+                log::warn!("Remote job check on focus failed (non-fatal): {}", error);
+            }
+        }
+        state.remote_jobs_running.store(false, Ordering::SeqCst);
+    });
+}
+
 pub fn run() {
     env_logger::init();
 
@@ -621,11 +657,25 @@ pub fn run() {
     // exits the process.
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let builder = builder.on_window_event(|window, event| {
-        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-            if window.label() == "main" {
-                api.prevent_close();
-                let _ = window.hide();
+        match event {
+            tauri::WindowEvent::CloseRequested { api, .. } => {
+                if window.label() == "main" {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
             }
+            // Mobile can't serve a Temp Link itself, so it asks this app to
+            // create one by leaving a job in Saved Messages (see
+            // `remote_catalog`). Deliberately no background timer: draining
+            // the queue when the window regains focus costs nothing while the
+            // app sits idle or hidden, and covers the case that matters —
+            // the user coming back to their PC.
+            tauri::WindowEvent::Focused(true) => {
+                if window.label() == "main" {
+                    drain_remote_jobs_on_focus(window.app_handle().clone());
+                }
+            }
+            _ => {}
         }
     });
 
@@ -718,6 +768,7 @@ pub fn run() {
                 peer_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
                 cancelled_transfers: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
                 remote_jobs_checked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                remote_jobs_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             });
             app.manage(Arc::new(bandwidth::BandwidthManager::new(app.handle())));
             app.manage(StreamConfig { token: stream_token.clone(), port: STREAM_PORT });

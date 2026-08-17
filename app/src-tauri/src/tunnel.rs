@@ -29,12 +29,16 @@ use tokio::process::Command;
 
 pub struct TunnelState {
     public_url: Arc<StdMutex<Option<String>>>,
+    /// When the folder-share list was last republished for mobile, used to
+    /// rate-limit that publication — see `republish_shares_for_mobile`.
+    last_share_publish: Arc<StdMutex<Option<std::time::Instant>>>,
 }
 
 impl TunnelState {
     pub fn new() -> Self {
         Self {
             public_url: Arc::new(StdMutex::new(None)),
+            last_share_publish: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -124,6 +128,48 @@ async fn resolve_binary(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dest)
 }
 
+/// Minimum gap between share-list publications triggered by a tunnel change.
+/// cloudflared respawns on a 15s backoff, and each publication costs an
+/// upload plus a delete in Saved Messages — without this floor, a flapping
+/// tunnel would spam the chat straight into a FLOOD_WAIT.
+const SHARE_REPUBLISH_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Republishes the folder-share list so mobile learns the tunnel's new public
+/// host. Best-effort and rate-limited: skipped entirely when the Telegram
+/// client isn't connected yet, or when the last publication was too recent.
+async fn republish_shares_for_mobile(app: &AppHandle, state: &Arc<TunnelState>) {
+    {
+        let mut last = match state.last_share_publish.lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+        if let Some(previous) = *last {
+            if previous.elapsed() < SHARE_REPUBLISH_MIN_INTERVAL {
+                log::debug!("Skipping share republish — last one was too recent");
+                return;
+            }
+        }
+        *last = Some(std::time::Instant::now());
+    }
+
+    // Re-read the client from state rather than holding a captured clone:
+    // reconnects and logout replace it (and kill the old one's runner), so a
+    // cached handle would be permanently dead.
+    let telegram_state = app.state::<crate::TelegramState>();
+    let client = { telegram_state.client.lock().await.clone() };
+    let Some(client) = client else {
+        log::debug!("Skipping share republish — Telegram client not connected");
+        return;
+    };
+
+    if let Err(error) =
+        crate::remote_catalog::publish_shares_to_telegram(app, &client, &telegram_state.peer_cache)
+            .await
+    {
+        log::warn!("Could not republish folder shares after tunnel change: {}", error);
+    }
+}
+
 /// Scans one line of cloudflared's log output for the quick-tunnel URL it
 /// prints once the tunnel is live, e.g.
 /// `...Visit it at: https://random-words-here.trycloudflare.com ...`.
@@ -202,8 +248,20 @@ pub fn start(app: AppHandle, local_port: u16, state: Arc<TunnelState>) {
                 log::debug!("[cloudflared] {}", line);
                 if let Some(url) = extract_tunnel_url(&line) {
                     log::info!("Temp Link public tunnel is live: {}", url);
-                    if let Ok(mut guard) = url_state.lock() {
-                        *guard = Some(url);
+                    let changed = match url_state.lock() {
+                        Ok(mut guard) => {
+                            let changed = guard.as_deref() != Some(url.as_str());
+                            *guard = Some(url);
+                            changed
+                        }
+                        Err(_) => false,
+                    };
+                    // A quick tunnel gets a brand-new random host every time
+                    // it respawns, which invalidates every link mobile is
+                    // showing. Republish so the phone picks up the new host
+                    // instead of displaying a dead URL.
+                    if changed {
+                        republish_shares_for_mobile(&app, &state).await;
                     }
                 }
             }

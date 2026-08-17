@@ -179,6 +179,22 @@ pub async fn ensure_client_initialized(
             {
                 log::warn!("Remote job check failed (non-fatal): {}", error);
             }
+
+            // Publish the share list once per launch even when no job ran.
+            // The public tunnel host changes on every restart, and the
+            // tunnel usually comes up BEFORE the Telegram client finishes
+            // connecting — so the republish triggered from `tunnel.rs` can
+            // find no client and skip. Without this, mobile would keep
+            // showing links pointing at the previous, now-dead host.
+            if let Err(error) = crate::remote_catalog::publish_shares_to_telegram(
+                &app_for_task,
+                &client_for_task,
+                &peer_cache,
+            )
+            .await
+            {
+                log::warn!("Could not publish folder shares on launch (non-fatal): {}", error);
+            }
         });
     }
 

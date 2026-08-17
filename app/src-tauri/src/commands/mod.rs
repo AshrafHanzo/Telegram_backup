@@ -33,6 +33,12 @@ pub struct TelegramState {
     /// `ensure_client_initialized` call sites first establishes the
     /// connection — not a continuous poll, just a single flag flip.
     pub remote_jobs_checked: Arc<std::sync::atomic::AtomicBool>,
+    /// True while a remote-jobs drain is in flight. Unlike
+    /// `remote_jobs_checked` (a one-shot for the launch check), this is a
+    /// re-entrancy guard: the window-focus trigger can fire repeatedly and in
+    /// quick succession, and `process_pending_jobs_once` is not re-entrant —
+    /// two overlapping runs would execute the same pending job twice.
+    pub remote_jobs_running: Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub mod auth;

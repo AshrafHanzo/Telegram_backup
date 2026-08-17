@@ -301,6 +301,141 @@ pub async fn cmd_revoke_share(
 
 // --- Temp Link Generator: permissioned, folder-scoped shares ---
 
+/// Inputs for `create_folder_share_inner`, shared by the interactive Tauri
+/// command and the remote-job handler that serves mobile's requests.
+///
+/// Note `password_hash` (already bcrypt-hashed) rather than a plaintext
+/// password, and an absolute `expires_at` rather than a duration — both so a
+/// mobile-originated request can be honoured without plaintext entering the
+/// job blob or the expiry window shifting to whenever desktop got around to
+/// running the job.
+pub(crate) struct CreateFolderShareParams {
+    /// `None` mints a fresh token. `Some` is a caller-supplied token (mobile
+    /// mints its own so a replayed job is a no-op instead of a second live
+    /// share) — an existing row with that id short-circuits as success.
+    pub share_id: Option<String>,
+    pub folder_id: Option<i64>,
+    pub folder_name: String,
+    pub can_upload: bool,
+    pub can_download: bool,
+    pub can_update: bool,
+    pub can_delete: bool,
+    pub username: Option<String>,
+    pub password_hash: Option<String>,
+    pub expires_at: Option<i64>,
+}
+
+/// Reads one share back as a `FolderShareInfo`, deriving `link` from the
+/// current base URL exactly like `cmd_list_folder_shares` does.
+fn select_folder_share(
+    conn: &sqlite::Connection,
+    share_id: &str,
+    base_url: &str,
+) -> Result<Option<FolderShareInfo>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, folder_id, folder_name, permissions, password_hash, username, expires_at, revoked, created_at
+             FROM folder_shares WHERE id = ?",
+        )
+        .map_err(|e| e.to_string())?;
+    stmt.bind((1, share_id)).map_err(|e| e.to_string())?;
+    if !matches!(stmt.next().map_err(|e| e.to_string())?, sqlite::State::Row) {
+        return Ok(None);
+    }
+    let id = stmt.read::<String, _>("id").map_err(|e| e.to_string())?;
+    let permissions =
+        SharePermissions::from_bits_truncate(stmt.read::<i64, _>("permissions").map_err(|e| e.to_string())?);
+    Ok(Some(FolderShareInfo {
+        link: format!("{}/s/{}", base_url, id),
+        id,
+        folder_id: stmt.read::<Option<i64>, _>("folder_id").ok().flatten(),
+        folder_name: stmt.read::<String, _>("folder_name").map_err(|e| e.to_string())?,
+        can_upload: permissions.contains(SharePermissions::UPLOAD),
+        can_download: permissions.contains(SharePermissions::DOWNLOAD),
+        can_update: permissions.contains(SharePermissions::UPDATE),
+        can_delete: permissions.contains(SharePermissions::DELETE),
+        has_password: stmt.read::<Option<String>, _>("password_hash").ok().flatten().is_some(),
+        username: stmt.read::<Option<String>, _>("username").ok().flatten(),
+        expires_at: stmt.read::<Option<i64>, _>("expires_at").ok().flatten(),
+        revoked: stmt.read::<i64, _>("revoked").map_err(|e| e.to_string())? != 0,
+        created_at: stmt.read::<i64, _>("created_at").map_err(|e| e.to_string())?,
+    }))
+}
+
+/// Core share-creation shared by the Tauri command and the remote-job
+/// handler — mirrors the `create_folder_inner` / `cmd_upload_file_inner`
+/// convention in `commands::fs`. Deliberately needs no Telegram client, only
+/// the database and an `AppHandle` (for the tunnel-derived base URL), which
+/// is what makes it callable from job context.
+pub(crate) fn create_folder_share_inner(
+    params: CreateFolderShareParams,
+    db_pool: &DbConnection,
+    app: &AppHandle,
+) -> Result<FolderShareInfo, String> {
+    let mut permissions = SharePermissions::empty();
+    if params.can_upload { permissions |= SharePermissions::UPLOAD; }
+    if params.can_download { permissions |= SharePermissions::DOWNLOAD; }
+    if params.can_update { permissions |= SharePermissions::UPDATE; }
+    if params.can_delete { permissions |= SharePermissions::DELETE; }
+    if permissions.is_empty() {
+        return Err("Choose at least one permission for this link".to_string());
+    }
+
+    let username = params
+        .username
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if username.is_some() && params.password_hash.is_none() {
+        return Err("Set a password before adding a username — a username alone isn't a login".to_string());
+    }
+
+    let base_url = share_base_url(app);
+    let conn = db_pool.lock().map_err(|e| e.to_string())?;
+
+    // Idempotency: a replayed job (the jobs blob has no locking, so a stale
+    // mobile write can re-present a completed job as pending) must not mint
+    // a second share for the same request.
+    if let Some(ref requested_id) = params.share_id {
+        if let Some(existing) = select_folder_share(&conn, requested_id, &base_url)? {
+            log::info!("Folder share {} already exists — treating as success", requested_id);
+            return Ok(existing);
+        }
+    }
+
+    let token = params.share_id.unwrap_or_else(generate_share_token);
+    let created_at = chrono::Utc::now().timestamp();
+
+    let mut stmt = conn.prepare(
+        "INSERT INTO folder_shares (id, folder_id, folder_name, permissions, password_hash, username, expires_at, revoked, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)"
+    ).map_err(|e| e.to_string())?;
+    stmt.bind((1, token.as_str())).map_err(|e| e.to_string())?;
+    stmt.bind((2, params.folder_id)).map_err(|e| e.to_string())?;
+    stmt.bind((3, params.folder_name.as_str())).map_err(|e| e.to_string())?;
+    stmt.bind((4, permissions.bits())).map_err(|e| e.to_string())?;
+    stmt.bind((5, params.password_hash.as_deref())).map_err(|e| e.to_string())?;
+    stmt.bind((6, username.as_deref())).map_err(|e| e.to_string())?;
+    stmt.bind((7, params.expires_at)).map_err(|e| e.to_string())?;
+    stmt.bind((8, created_at)).map_err(|e| e.to_string())?;
+    stmt.next().map_err(|e| e.to_string())?;
+
+    Ok(FolderShareInfo {
+        link: format!("{}/s/{}", base_url, token),
+        id: token,
+        folder_id: params.folder_id,
+        folder_name: params.folder_name,
+        can_upload: params.can_upload,
+        can_download: params.can_download,
+        can_update: params.can_update,
+        can_delete: params.can_delete,
+        has_password: params.password_hash.is_some(),
+        username,
+        expires_at: params.expires_at,
+        revoked: false,
+        created_at,
+    })
+}
+
 #[tauri::command]
 pub async fn cmd_create_folder_share(
     folder_id: Option<i64>,
@@ -315,60 +450,28 @@ pub async fn cmd_create_folder_share(
     db_pool: State<'_, DbConnection>,
     app: AppHandle,
 ) -> Result<FolderShareInfo, String> {
-    let mut permissions = SharePermissions::empty();
-    if can_upload { permissions |= SharePermissions::UPLOAD; }
-    if can_download { permissions |= SharePermissions::DOWNLOAD; }
-    if can_update { permissions |= SharePermissions::UPDATE; }
-    if can_delete { permissions |= SharePermissions::DELETE; }
-    if permissions.is_empty() {
-        return Err("Choose at least one permission for this link".to_string());
-    }
-
-    let token = generate_share_token();
-    let created_at = chrono::Utc::now().timestamp();
-    let expires_at = expiry_hours.map(|hours| created_at + hours * 3600);
-
     let password_hash = match password {
         Some(ref pwd) if !pwd.is_empty() => Some(hash_password(pwd)?),
         _ => None,
     };
-    let username = username.map(|value| value.trim().to_string()).filter(|value| !value.is_empty());
-    if username.is_some() && password_hash.is_none() {
-        return Err("Set a password before adding a username — a username alone isn't a login".to_string());
-    }
+    let expires_at = expiry_hours.map(|hours| chrono::Utc::now().timestamp() + hours * 3600);
 
-    let conn = db_pool.lock().map_err(|e| e.to_string())?;
-    let mut stmt = conn.prepare(
-        "INSERT INTO folder_shares (id, folder_id, folder_name, permissions, password_hash, username, expires_at, revoked, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)"
-    ).map_err(|e| e.to_string())?;
-    stmt.bind((1, token.as_str())).map_err(|e| e.to_string())?;
-    stmt.bind((2, folder_id)).map_err(|e| e.to_string())?;
-    stmt.bind((3, folder_name.as_str())).map_err(|e| e.to_string())?;
-    stmt.bind((4, permissions.bits())).map_err(|e| e.to_string())?;
-    stmt.bind((5, password_hash.as_deref())).map_err(|e| e.to_string())?;
-    stmt.bind((6, username.as_deref())).map_err(|e| e.to_string())?;
-    stmt.bind((7, expires_at)).map_err(|e| e.to_string())?;
-    stmt.bind((8, created_at)).map_err(|e| e.to_string())?;
-    stmt.next().map_err(|e| e.to_string())?;
-
-    let link = format!("{}/s/{}", share_base_url(&app), token);
-
-    Ok(FolderShareInfo {
-        id: token,
-        folder_id,
-        folder_name,
-        can_upload,
-        can_download,
-        can_update,
-        can_delete,
-        has_password: password_hash.is_some(),
-        username,
-        expires_at,
-        revoked: false,
-        created_at,
-        link,
-    })
+    create_folder_share_inner(
+        CreateFolderShareParams {
+            share_id: None,
+            folder_id,
+            folder_name,
+            can_upload,
+            can_download,
+            can_update,
+            can_delete,
+            username,
+            password_hash,
+            expires_at,
+        },
+        &db_pool,
+        &app,
+    )
 }
 
 #[tauri::command]
@@ -423,9 +526,18 @@ pub async fn cmd_revoke_folder_share(
     id: String,
     db_pool: State<'_, DbConnection>,
 ) -> Result<(), String> {
+    revoke_folder_share_inner(&id, &db_pool)
+}
+
+/// Shared by the Tauri command above and the remote-job handler. Naturally
+/// idempotent (a plain `UPDATE`), so a replayed job needs no extra guard.
+pub(crate) fn revoke_folder_share_inner(
+    share_id: &str,
+    db_pool: &DbConnection,
+) -> Result<(), String> {
     let conn = db_pool.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn.prepare("UPDATE folder_shares SET revoked = 1 WHERE id = ?").map_err(|e| e.to_string())?;
-    stmt.bind((1, id.as_str())).map_err(|e| e.to_string())?;
+    stmt.bind((1, share_id)).map_err(|e| e.to_string())?;
     stmt.next().map_err(|e| e.to_string())?;
 
     Ok(())
