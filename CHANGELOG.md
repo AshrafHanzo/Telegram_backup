@@ -1,3 +1,14 @@
+## [3.0.1] - 2026-08-18
+
+### Fixes
+
+- Fixed downloads from a "Generate Temp Link" share opening in the browser instead of saving — the share route sent no `Content-Disposition` header, so images, PDFs and videos were rendered inline. Filenames containing non-ASCII characters are now also preserved correctly instead of dropping the header entirely.
+
+### Temp Link Sharing
+
+- Share uploads now stream straight through to Telegram as bytes arrive, instead of buffering the whole file locally and only then starting the Telegram upload. A large file no longer sits at "100%" for a long, unexplained pause, and the progress bar reflects the real end-to-end transfer rate.
+- Redesigned the shared-folder page as a proper product surface: app header bar, folder summary (file count and total size), a thumbnail card grid, and an upload panel with labelled speed / remaining / elapsed statistics.
+
 ## [3.0.0] - 2026-08-17
 
 ### Large File Support
