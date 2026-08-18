@@ -3,7 +3,7 @@
 ### Large uploads through a Temp Link
 
 - Share-page uploads are now sent in chunks instead of one long request. A multi-GB upload previously had to keep a single connection alive for the whole transfer, and over a mobile connection it did not — a 4GB upload reset roughly a quarter of the way through on three attempts in a row, and because each retry restarted from the beginning it could never finish. A dropped chunk is now retried on its own and the bytes already transferred are kept.
-- An interrupted upload can resume: the server reports how much it has staged, so the browser continues from there rather than starting over.
+- An interrupted upload can resume: the server reports how much it has staged, so the browser continues from there rather than starting over. A chunk that fails for any reason now asks the server where the file actually ends before treating it as an error, so an ambiguous drop is recovered from rather than retried blindly.
 
 ### Diagnostics
 

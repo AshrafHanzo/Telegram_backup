@@ -791,6 +791,10 @@ const UPLOAD_SCRIPT_TEMPLATE: &str = r#"
     // requests.
     var CHUNK_SIZE = 8 * 1024 * 1024;
     var MAX_CHUNK_ATTEMPTS = 5;
+    // Resyncing to the server's offset isn't a retry, so it doesn't consume an
+    // attempt — but it still needs a ceiling, or a server whose staged length
+    // keeps shifting would keep us here forever.
+    var MAX_RESYNCS = 20;
 
     function formatBytes(n) {
         if (!n || n <= 0) return '0 B';
@@ -871,6 +875,27 @@ const UPLOAD_SCRIPT_TEMPLATE: &str = r#"
         });
     }
 
+    // How many bytes the server has actually staged, or null if it can't say.
+    // This is what makes an ambiguous failure recoverable: the staged length is
+    // authoritative, so we never have to guess whether a chunk landed.
+    function stagedOffset(uploadId) {
+        return new Promise(function (resolve) {
+            var xhr = new XMLHttpRequest();
+            xhr.open('GET', '/s/' + TOKEN + '/files/chunk/' + uploadId);
+            xhr.addEventListener('load', function () {
+                try {
+                    var body = JSON.parse(xhr.responseText || '{}');
+                    resolve(typeof body.received === 'number' ? body.received : null);
+                } catch (_) {
+                    resolve(null);
+                }
+            });
+            xhr.addEventListener('error', function () { resolve(null); });
+            xhr.addEventListener('abort', function () { resolve(null); });
+            xhr.send();
+        });
+    }
+
     async function startUpload(files) {
         uploadZone.style.display = 'none';
         progressCard.style.display = 'block';
@@ -930,6 +955,7 @@ const UPLOAD_SCRIPT_TEMPLATE: &str = r#"
             var uploadId = randomUploadId();
             var offset = 0;
             var attempts = 0;
+            var resyncs = 0;
             var failed = false;
             var fileStartBanked = bankedBytes;
 
@@ -953,13 +979,31 @@ const UPLOAD_SCRIPT_TEMPLATE: &str = r#"
                     updateOverall();
                 } catch (e) {
                     inFlight = 0;
-                    if (e && typeof e.resync === 'number') {
+                    if (e && typeof e.resync === 'number' && resyncs < MAX_RESYNCS) {
                         // Not a failure: the server and we disagreed on the
                         // offset, so continue from what it actually has.
+                        resyncs++;
                         offset = e.resync;
                         bankedBytes = fileStartBanked + offset;
                         updateOverall();
                         continue;
+                    }
+                    // A dropped connection can't report how much of the chunk
+                    // landed, and the server answers a rejected chunk before
+                    // reading its body — which closes the connection, so that
+                    // rejection can reach us as a bare network error instead of
+                    // its status code. Either way the staged file's length is
+                    // the truth, so ask for it before calling this a failure.
+                    if (resyncs < MAX_RESYNCS) {
+                        var staged = await stagedOffset(uploadId);
+                        if (staged !== null && staged !== offset) {
+                            resyncs++;
+                            offset = staged;
+                            bankedBytes = fileStartBanked + offset;
+                            attempts = 0;
+                            updateOverall();
+                            continue;
+                        }
                     }
                     attempts++;
                     if (attempts >= MAX_CHUNK_ATTEMPTS) {
