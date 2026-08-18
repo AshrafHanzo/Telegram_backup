@@ -875,17 +875,18 @@ const UPLOAD_SCRIPT_TEMPLATE: &str = r#"
         });
     }
 
-    // How many bytes the server has actually staged, or null if it can't say.
-    // This is what makes an ambiguous failure recoverable: the staged length is
-    // authoritative, so we never have to guess whether a chunk landed.
-    function stagedOffset(uploadId) {
+    // What the server has staged, and how much of it has reached Telegram, or
+    // null if it can't say. The staged length is what makes an ambiguous
+    // failure recoverable - we never have to guess whether a chunk landed -
+    // and the sent figure is what the progress bar shows.
+    function stagedProgress(uploadId) {
         return new Promise(function (resolve) {
             var xhr = new XMLHttpRequest();
             xhr.open('GET', '/s/' + TOKEN + '/files/chunk/' + uploadId);
             xhr.addEventListener('load', function () {
                 try {
                     var body = JSON.parse(xhr.responseText || '{}');
-                    resolve(typeof body.received === 'number' ? body.received : null);
+                    resolve(typeof body.received === 'number' ? body : null);
                 } catch (_) {
                     resolve(null);
                 }
@@ -958,34 +959,54 @@ const UPLOAD_SCRIPT_TEMPLATE: &str = r#"
             var resyncs = 0;
             var failed = false;
             var fileStartBanked = bankedBytes;
+            // Bytes of THIS file that Telegram has taken. The bar follows this
+            // rather than what we've uploaded to the desktop, because the
+            // desktop reaching 100% only means the first of two transfers is
+            // done - which is what used to leave the bar sitting at 100%.
+            var fileSent = 0;
+
+            function paint() {
+                var fraction = file.size > 0 ? Math.min(1, fileSent / file.size) : 0;
+                rows[i].fill.style.width = (fraction * 100) + '%';
+                rows[i].pct.textContent = Math.round(fraction * 100) + '%';
+                bankedBytes = fileStartBanked + fileSent;
+                updateOverall();
+            }
+
+            // Telegram's figure only comes back with a server reply, so it is
+            // polled as well - otherwise the bar would freeze during the final
+            // request, which stays open until the transfer really finishes.
+            var pollTimer = setInterval(function () {
+                stagedProgress(uploadId).then(function (progress) {
+                    if (progress && typeof progress.sent === 'number' && progress.sent > fileSent) {
+                        fileSent = progress.sent;
+                        paint();
+                    }
+                });
+            }, 800);
 
             while (offset < file.size) {
-                var chunkStart = offset;
                 try {
-                    var body = await putChunk(uploadId, file, offset, function (loaded) {
-                        inFlight = loaded;
-                        rows[i].fill.style.width = ((chunkStart + loaded) / file.size) * 100 + '%';
-                        rows[i].pct.textContent = Math.round(((chunkStart + loaded) / file.size) * 100) + '%';
-                        updateOverall();
+                    var body = await putChunk(uploadId, file, offset, function () {
+                        // Deliberately ignored: bytes accepted here are not yet
+                        // bytes stored, and showing them would overstate it.
                     });
                     // Trust the server's own count where it gives one; it's
                     // the staged file's real length.
                     offset = typeof body.received === 'number'
                         ? body.received
                         : Math.min(offset + CHUNK_SIZE, file.size);
-                    bankedBytes = fileStartBanked + offset;
-                    inFlight = 0;
+                    if (typeof body.sent === 'number' && body.sent > fileSent) {
+                        fileSent = body.sent;
+                    }
                     attempts = 0;
-                    updateOverall();
+                    paint();
                 } catch (e) {
-                    inFlight = 0;
                     if (e && typeof e.resync === 'number' && resyncs < MAX_RESYNCS) {
                         // Not a failure: the server and we disagreed on the
                         // offset, so continue from what it actually has.
                         resyncs++;
                         offset = e.resync;
-                        bankedBytes = fileStartBanked + offset;
-                        updateOverall();
                         continue;
                     }
                     // A dropped connection can't report how much of the chunk
@@ -995,13 +1016,11 @@ const UPLOAD_SCRIPT_TEMPLATE: &str = r#"
                     // its status code. Either way the staged file's length is
                     // the truth, so ask for it before calling this a failure.
                     if (resyncs < MAX_RESYNCS) {
-                        var staged = await stagedOffset(uploadId);
-                        if (staged !== null && staged !== offset) {
+                        var progress = await stagedProgress(uploadId);
+                        if (progress !== null && progress.received !== offset) {
                             resyncs++;
-                            offset = staged;
-                            bankedBytes = fileStartBanked + offset;
+                            offset = progress.received;
                             attempts = 0;
-                            updateOverall();
                             continue;
                         }
                     }
@@ -1020,7 +1039,11 @@ const UPLOAD_SCRIPT_TEMPLATE: &str = r#"
                 }
             }
 
+            clearInterval(pollTimer);
             if (!failed) {
+                // The final request only returns once Telegram has the whole
+                // file, so this is a real completion, not an optimistic one.
+                fileSent = file.size;
                 rows[i].fill.style.width = '100%';
                 rows[i].pct.textContent = 'Done';
                 rows[i].pct.className = 'progress-row-state ok';
@@ -2036,6 +2059,11 @@ fn sweep_abandoned_staging_files() {
 struct ChunkAccepted {
     received: u64,
     total: u64,
+    /// Bytes already forwarded to Telegram. The browser shows this rather than
+    /// `received`, because reaching the total here means the upload is finished
+    /// — whereas `received` hitting the total only means the first of two legs
+    /// is done, which is what used to leave the bar stuck at 100%.
+    sent: u64,
 }
 
 /// How many bytes of a given upload have already landed, so a browser that
@@ -2060,7 +2088,113 @@ async fn upload_chunk_status(
         .await
         .map(|metadata| metadata.len())
         .unwrap_or(0);
-    HttpResponse::Ok().json(serde_json::json!({ "received": received }))
+    // Also reports how much has reached Telegram, which is what the page shows
+    // as progress — and the only way it can keep updating while the final chunk
+    // request is still open waiting for the last of the transfer.
+    let sent = crate::share_upload_pipeline::lookup(&upload_id)
+        .map_or(0, |pipeline| pipeline.sent_bytes());
+    HttpResponse::Ok().json(serde_json::json!({ "received": received, "sent": sent }))
+}
+
+/// Generous ceiling on how long a pipelined upload may stay open, so an
+/// uploader that walks away can't hold a bandwidth reservation and a parked
+/// task indefinitely. Scaled by size, because a big file legitimately takes
+/// longer, with a floor for small ones on a bad connection.
+fn pipeline_deadline(total_size: u64) -> std::time::Duration {
+    const FLOOR_SECS: u64 = 15 * 60;
+    // ~20KB/s is slower than any connection that could realistically finish,
+    // so this only ever fires on a genuinely stalled upload.
+    let allowance = total_size / (20 * 1024);
+    std::time::Duration::from_secs(FLOOR_SECS.max(allowance))
+}
+
+/// Starts the Telegram half of an upload so it runs while the browser is still
+/// sending, instead of waiting for the whole file to land first.
+///
+/// Returns `None` when pipelining isn't possible — no Telegram client, quota
+/// refusal, an unresolvable folder. The caller then falls back to sending the
+/// completed staging file, which is exactly the behaviour before this existed.
+#[allow(clippy::too_many_arguments)]
+async fn start_pipelined_upload(
+    upload_id: &str,
+    total_size: u64,
+    filename: &str,
+    folder_id: Option<i64>,
+    tg_state: &Arc<TelegramState>,
+    net_config: &Arc<NetworkConfig>,
+    bw_manager: &Arc<BandwidthManager>,
+) -> Option<Arc<crate::share_upload_pipeline::PipelinedUpload>> {
+    let client = { tg_state.client.lock().await.clone() }?;
+    // Reserved up front rather than at the end: by the time the last chunk
+    // arrives the bytes have already gone to Telegram, so checking the quota
+    // then would be too late to enforce it.
+    if let Err(error) = bw_manager.try_reserve_up(total_size) {
+        log::warn!("Share upload {} not pipelined, quota refused: {}", upload_id, error);
+        return None;
+    }
+    let peer = match resolve_peer(&client, folder_id, &tg_state.peer_cache).await {
+        Ok(peer) => peer,
+        Err(error) => {
+            bw_manager.release_up(total_size);
+            log::warn!("Share upload {} not pipelined, folder unresolved: {}", upload_id, error);
+            return None;
+        }
+    };
+
+    let (upload, mut reader) = crate::share_upload_pipeline::create(total_size);
+    if !crate::share_upload_pipeline::register(upload_id, upload.clone()) {
+        // A concurrent request for the same id already started one; use theirs.
+        bw_manager.release_up(total_size);
+        return crate::share_upload_pipeline::lookup(upload_id);
+    }
+
+    let job = upload.clone();
+    let net_config = net_config.clone();
+    let bw_manager = bw_manager.clone();
+    let name = filename.to_string();
+    let id = upload_id.to_string();
+    let deadline = pipeline_deadline(total_size);
+    tauri::async_runtime::spawn(async move {
+        let send = async {
+            if split_file::should_split(total_size) {
+                stream_split_file_to_telegram(
+                    &client, &peer, &net_config, name, &mut reader, total_size,
+                )
+                .await
+            } else {
+                stream_single_file_to_telegram(
+                    &client, &peer, &net_config, name, &mut reader, total_size,
+                )
+                .await
+            }
+        };
+        let result = match tokio::time::timeout(deadline, send).await {
+            Ok(result) => result,
+            Err(_) => Err(format!(
+                "Upload stalled for more than {}s",
+                deadline.as_secs()
+            )),
+        };
+        match &result {
+            Ok(message_id) => log::info!(
+                "Share upload {} sent to Telegram as message {} while still uploading",
+                id, message_id
+            ),
+            Err(error) => {
+                // Not fatal, and deliberately leaves the staging file alone:
+                // it still holds every byte received, so the last chunk falls
+                // back to sending it the old way. The reservation is released
+                // because that fallback takes its own.
+                log::warn!("Share upload {} pipelined send failed: {}", id, error);
+                bw_manager.release_up(total_size);
+                // Dropped from the registry so later chunks stop feeding a
+                // pipeline nothing is draining and simply stage as before.
+                crate::share_upload_pipeline::forget(&id);
+            }
+        }
+        job.store_outcome(result).await;
+    });
+    Some(upload)
 }
 
 /// Chunked, resumable upload — what the share page actually uses.
@@ -2155,6 +2289,27 @@ async fn upload_file_chunk(
         }));
     }
 
+    // Start (or rejoin) the Telegram side so it uploads alongside this request
+    // rather than after the whole file has landed. Only the first chunk starts
+    // one; if it can't be started the upload still works, just sequentially at
+    // the end as it did before.
+    let pipeline = match crate::share_upload_pipeline::lookup(&upload_id) {
+        Some(existing) => Some(existing),
+        None if offset == 0 => {
+            start_pipelined_upload(
+                &upload_id,
+                total_size,
+                &filename,
+                row.folder_id,
+                &tg_state,
+                &net_config,
+                &bw_manager,
+            )
+            .await
+        }
+        None => None,
+    };
+
     let mut file = match tokio::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -2197,6 +2352,13 @@ async fn upload_file_chunk(
             log::error!("Could not write share-upload chunk: {}", error);
             return HttpResponse::InternalServerError().body("Could not stage upload");
         }
+        // Forward only after the write succeeded, so the staging file stays the
+        // authoritative record. A refusal here just means the Telegram side has
+        // gone away; staging continues and the fallback picks it up.
+        if let Some(pipeline) = &pipeline {
+            let position = offset + written - bytes.len() as u64;
+            pipeline.feed(position, &bytes).await;
+        }
     }
     if let Err(error) = file.flush().await {
         log::error!("Could not flush share-upload chunk: {}", error);
@@ -2212,7 +2374,37 @@ async fn upload_file_chunk(
     drop(file);
 
     if banked < total_size {
-        return HttpResponse::Ok().json(ChunkAccepted { received: banked, total: total_size });
+        return HttpResponse::Ok().json(ChunkAccepted {
+            received: banked,
+            total: total_size,
+            sent: pipeline.as_ref().map_or(0, |pipeline| pipeline.sent_bytes()),
+        });
+    }
+
+    // Every byte is in. When the pipeline is still healthy it has been sending
+    // all along, so this closes the stream and waits for the tail — moments,
+    // rather than a second transfer of the whole file.
+    if let Some(pipeline) = &pipeline {
+        if !pipeline.has_failed() {
+            pipeline.finish_feeding().await;
+            match pipeline.wait_for_outcome().await {
+                Ok(message_id) => {
+                    crate::share_upload_pipeline::forget(&upload_id);
+                    let _ = tokio::fs::remove_file(&staging_path).await;
+                    log::info!(
+                        "Share upload {} completed as message {} (pipelined)",
+                        upload_id, message_id
+                    );
+                    return HttpResponse::Ok()
+                        .json(serde_json::json!({ "message_id": message_id }));
+                }
+                Err(error) => log::warn!(
+                    "Share upload {} falling back to sending the staged file: {}",
+                    upload_id, error
+                ),
+            }
+        }
+        crate::share_upload_pipeline::forget(&upload_id);
     }
 
     // The last chunk landed — hand the assembled file to Telegram.

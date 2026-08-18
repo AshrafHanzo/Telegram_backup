@@ -1,3 +1,11 @@
+## [Unreleased]
+
+### Temp Link uploads
+
+- A share upload no longer pauses after the progress bar reaches 100%. The file was received in full first and only then sent on to Telegram, so there was a second transfer of the same size with nothing on screen to explain it — about 35 seconds for a 113MB file, and roughly 20 minutes for a 4GB one. Telegram now receives the file as it arrives, so both transfers happen at once and the remaining wait is the last chunk rather than the whole file.
+- The progress bar now follows how much has actually reached Telegram instead of how much reached the desktop, so 100% means finished rather than half done.
+- Temp Links can be pointed at your own domain instead of the random Cloudflare address that changes every time the tunnel restarts (which broke every link already shared). When one is set, the automatic tunnel is not started at all.
+
 ## [3.1.0] - 2026-08-19
 
 ### Large uploads through a Temp Link

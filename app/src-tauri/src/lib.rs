@@ -67,6 +67,7 @@ pub mod folder_share_routes;
 pub mod google_auth;
 pub mod audit_sync;
 pub mod remote_catalog;
+pub mod share_upload_pipeline;
 pub mod split_file;
 pub mod tunnel;
 pub mod relay;
