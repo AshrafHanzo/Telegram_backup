@@ -623,7 +623,31 @@ fn drain_remote_jobs_on_focus(app: tauri::AppHandle) {
 }
 
 pub fn run() {
-    env_logger::init();
+    // Deliberately NOT env_logger: it writes to stderr, and a GUI app has no
+    // console attached, so every log line was going nowhere. That made
+    // user-reported failures (a share upload resetting mid-transfer, say)
+    // impossible to diagnose after the fact. Logs now also land in a rotated
+    // file under the app's log directory — on Windows,
+    // %APPDATA%/<identifier>/logs/. `tauri_plugin_log` installs the global
+    // logger itself, so `env_logger::init()` must not also run.
+    let log_plugin = tauri_plugin_log::Builder::new()
+        .targets([
+            tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
+            tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
+                file_name: Some("telegram-drive".to_string()),
+            }),
+        ])
+        // Keep the previous file around across a rotation so a crash right
+        // after the rollover doesn't lose the interesting part.
+        .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepOne)
+        .max_file_size(8 * 1024 * 1024)
+        .level(log::LevelFilter::Info)
+        // Chatty dependencies would otherwise bury our own lines.
+        .level_for("grammers_mtsender", log::LevelFilter::Warn)
+        .level_for("grammers_session", log::LevelFilter::Warn)
+        .level_for("hyper", log::LevelFilter::Warn)
+        .level_for("rustls", log::LevelFilter::Warn)
+        .build();
 
     let stream_token = generate_stream_token();
 
@@ -633,6 +657,7 @@ pub fn run() {
     let server_handle_for_setup = server_handle.clone();
 
     let builder = tauri::Builder::default()
+        .plugin(log_plugin)
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_store::Builder::default().build())

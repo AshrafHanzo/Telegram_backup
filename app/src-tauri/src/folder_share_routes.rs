@@ -759,13 +759,18 @@ const SHARE_PAGE_CSS: &str = r#"
     }
 "#;
 
-/// Drives multi-file uploads via `XMLHttpRequest` (its `upload.onprogress`
-/// event is the only way to get real byte-level upload progress in vanilla
-/// JS — `fetch()` still doesn't expose one) instead of the plain form's
-/// full-page-navigating submit. Uploads run one at a time (the backend
-/// route accepts a single file per POST) while tracking both a per-file bar
-/// and a combined total/speed/ETA/elapsed summary. `__TOKEN__` is replaced
-/// with the real share token before this is embedded in the page.
+/// Drives multi-file uploads from the share page in chunks.
+///
+/// Sending a whole file as one request required that single request to survive
+/// the entire transfer, which for a multi-GB file over a mobile connection it
+/// doesn't — a 4GB upload reset about a quarter of the way through, three
+/// attempts running, each restarting from zero. Uploading in slices means a
+/// dropped connection costs one slice, not the file, and the server tracks
+/// progress by the staged file's own length so the browser can resync to it.
+///
+/// `XMLHttpRequest` rather than `fetch` because only XHR exposes upload
+/// progress events. `__TOKEN__` is replaced with the real share token before
+/// this is embedded in the page.
 const UPLOAD_SCRIPT_TEMPLATE: &str = r#"
 (function () {
     var TOKEN = "__TOKEN__";
@@ -780,6 +785,12 @@ const UPLOAD_SCRIPT_TEMPLATE: &str = r#"
     var overallSpeed = document.getElementById('overallSpeed');
     var overallEta = document.getElementById('overallEta');
     var overallElapsed = document.getElementById('overallElapsed');
+
+    // Small enough that losing one to a dropped connection is cheap, large
+    // enough that a multi-GB file doesn't turn into tens of thousands of
+    // requests.
+    var CHUNK_SIZE = 8 * 1024 * 1024;
+    var MAX_CHUNK_ATTEMPTS = 5;
 
     function formatBytes(n) {
         if (!n || n <= 0) return '0 B';
@@ -796,11 +807,19 @@ const UPLOAD_SCRIPT_TEMPLATE: &str = r#"
         if (m > 0) return m + 'm ' + s + 's';
         return s + 's';
     }
+    function randomUploadId() {
+        var bytes = new Uint8Array(16);
+        crypto.getRandomValues(bytes);
+        var out = '';
+        for (var i = 0; i < bytes.length; i++) out += ('0' + bytes[i].toString(16)).slice(-2);
+        return out;
+    }
+    function sleep(ms) {
+        return new Promise(function (resolve) { setTimeout(resolve, ms); });
+    }
 
     browseLink.addEventListener('click', function (e) { e.stopPropagation(); fileInput.click(); });
     uploadZone.addEventListener('click', function () { fileInput.click(); });
-    // The dropzone is a div with role="button", so Enter/Space have to be
-    // wired up by hand to match native button behaviour.
     uploadZone.addEventListener('keydown', function (e) {
         if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fileInput.click(); }
     });
@@ -818,14 +837,48 @@ const UPLOAD_SCRIPT_TEMPLATE: &str = r#"
         if (files.length) startUpload(files);
     });
 
-    function startUpload(files) {
+    // Resolves with the server's JSON. Rejects with `{ resync: n }` when the
+    // server reports a different offset (409) so the caller can jump to where
+    // the staged file actually ends instead of burning a retry.
+    function putChunk(uploadId, file, offset, onProgress) {
+        return new Promise(function (resolve, reject) {
+            var end = Math.min(offset + CHUNK_SIZE, file.size);
+            var xhr = new XMLHttpRequest();
+            xhr.open('POST', '/s/' + TOKEN + '/files/chunk');
+            xhr.setRequestHeader('X-Upload-Id', uploadId);
+            xhr.setRequestHeader('X-Chunk-Offset', String(offset));
+            xhr.setRequestHeader('X-Total-Size', String(file.size));
+            // Header values must be ASCII, so a non-ASCII name is
+            // percent-encoded here and decoded server-side.
+            xhr.setRequestHeader('X-Filename', encodeURIComponent(file.name));
+            xhr.upload.addEventListener('progress', function (e) {
+                if (e.lengthComputable) onProgress(e.loaded);
+            });
+            xhr.addEventListener('load', function () {
+                var body = {};
+                try { body = JSON.parse(xhr.responseText || '{}'); } catch (_) {}
+                if (xhr.status >= 200 && xhr.status < 300) {
+                    resolve(body);
+                } else if (xhr.status === 409 && typeof body.received === 'number') {
+                    reject({ resync: body.received });
+                } else {
+                    reject(new Error('HTTP ' + xhr.status + ' ' + (xhr.responseText || '')));
+                }
+            });
+            xhr.addEventListener('error', function () { reject(new Error('network error')); });
+            xhr.addEventListener('abort', function () { reject(new Error('aborted')); });
+            xhr.send(file.slice(offset, end));
+        });
+    }
+
+    async function startUpload(files) {
         uploadZone.style.display = 'none';
         progressCard.style.display = 'block';
         fileListEl.innerHTML = '';
 
         var totalBytes = files.reduce(function (sum, f) { return sum + f.size; }, 0);
-        var uploadedBase = 0;
-        var currentLoaded = 0;
+        var bankedBytes = 0;   // fully confirmed across every file so far
+        var inFlight = 0;      // bytes of the chunk currently being sent
         var startTime = Date.now();
         var lastTick = startTime;
         var lastBytes = 0;
@@ -842,100 +895,94 @@ const UPLOAD_SCRIPT_TEMPLATE: &str = r#"
         });
 
         var elapsedTimer = setInterval(function () {
-            overallElapsed.textContent = 'Elapsed ' + formatTime((Date.now() - startTime) / 1000);
+            overallElapsed.textContent = formatTime((Date.now() - startTime) / 1000);
         }, 1000);
 
         function updateOverall() {
-            var loaded = uploadedBase + currentLoaded;
+            var loaded = bankedBytes + inFlight;
             var pct = totalBytes > 0 ? Math.min(100, (loaded / totalBytes) * 100) : 0;
             overallBar.style.width = pct + '%';
             overallPercent.textContent = Math.round(pct) + '%';
             overallStats.textContent = formatBytes(loaded) + ' / ' + formatBytes(totalBytes);
             var now = Date.now();
             var dt = (now - lastTick) / 1000;
-            if (dt >= 0.4) {
+            if (dt >= 0.5) {
                 var speed = (loaded - lastBytes) / dt;
-                overallSpeed.textContent = speed > 0 ? formatBytes(speed) + '/s' : '';
-                var remaining = totalBytes - loaded;
-                overallEta.textContent = speed > 0 ? 'ETA ' + formatTime(remaining / speed) : '';
+                if (speed > 0) {
+                    overallSpeed.textContent = formatBytes(speed) + '/s';
+                    overallEta.textContent = formatTime((totalBytes - loaded) / speed);
+                }
                 lastTick = now;
                 lastBytes = loaded;
             }
         }
 
-        // Posts the raw File as the request body (not a multipart form) so
-        // the server gets an exact Content-Length up front and can forward
-        // bytes to Telegram as they arrive instead of buffering the whole
-        // file to disk first — see `upload_file_streaming`. A useful side
-        // effect: because the server can only drain the body as fast as
-        // Telegram accepts it, this progress bar now reflects the real
-        // end-to-end rate rather than just filling the local buffer.
-        //
-        // Streaming means the server can't retry a failed upload (the body
-        // is consumed once), so retrying is done here instead — the File is
-        // still in memory, so the whole request can simply be re-sent.
-        var MAX_ATTEMPTS = 3;
-
-        function uploadOne(i, attempt) {
-            if (i >= files.length) {
-                clearInterval(elapsedTimer);
-                overallPercent.textContent = '100%';
-                overallEta.textContent = '';
-                setTimeout(function () { location.reload(); }, 700);
-                return;
-            }
-            attempt = attempt || 1;
+        for (var i = 0; i < files.length; i++) {
             var file = files[i];
-            currentLoaded = 0;
+            var uploadId = randomUploadId();
+            var offset = 0;
+            var attempts = 0;
+            var failed = false;
+            var fileStartBanked = bankedBytes;
 
-            function failedOrRetry(reason) {
-                if (attempt < MAX_ATTEMPTS) {
-                    rows[i].pct.textContent = 'Retrying ' + (attempt + 1) + '/' + MAX_ATTEMPTS;
-                    rows[i].pct.className = 'progress-row-state';
-                    rows[i].fill.style.width = '0%';
-                    currentLoaded = 0;
-                    setTimeout(function () { uploadOne(i, attempt + 1); }, 1500 * attempt);
-                    return;
+            while (offset < file.size) {
+                var chunkStart = offset;
+                try {
+                    var body = await putChunk(uploadId, file, offset, function (loaded) {
+                        inFlight = loaded;
+                        rows[i].fill.style.width = ((chunkStart + loaded) / file.size) * 100 + '%';
+                        rows[i].pct.textContent = Math.round(((chunkStart + loaded) / file.size) * 100) + '%';
+                        updateOverall();
+                    });
+                    // Trust the server's own count where it gives one; it's
+                    // the staged file's real length.
+                    offset = typeof body.received === 'number'
+                        ? body.received
+                        : Math.min(offset + CHUNK_SIZE, file.size);
+                    bankedBytes = fileStartBanked + offset;
+                    inFlight = 0;
+                    attempts = 0;
+                    updateOverall();
+                } catch (e) {
+                    inFlight = 0;
+                    if (e && typeof e.resync === 'number') {
+                        // Not a failure: the server and we disagreed on the
+                        // offset, so continue from what it actually has.
+                        offset = e.resync;
+                        bankedBytes = fileStartBanked + offset;
+                        updateOverall();
+                        continue;
+                    }
+                    attempts++;
+                    if (attempts >= MAX_CHUNK_ATTEMPTS) {
+                        console.error('Upload failed for ' + file.name + ': ' + (e && e.message ? e.message : e));
+                        rows[i].pct.textContent = 'Failed';
+                        rows[i].pct.className = 'progress-row-state fail';
+                        failed = true;
+                        break;
+                    }
+                    rows[i].pct.textContent = 'Retrying ' + attempts + '/' + (MAX_CHUNK_ATTEMPTS - 1);
+                    // Back off a little between tries so a brief outage has a
+                    // chance to clear.
+                    await sleep(1000 * attempts);
                 }
-                console.error('Upload failed for ' + file.name + ': ' + reason);
-                rows[i].pct.textContent = 'Failed';
-                rows[i].pct.className = 'progress-row-state fail';
-                uploadOne(i + 1, 1);
             }
 
-            var xhr = new XMLHttpRequest();
-            xhr.open('POST', '/s/' + TOKEN + '/files/stream');
-            // Header values must be ASCII, so a name with non-ASCII
-            // characters is percent-encoded here and decoded server-side.
-            xhr.setRequestHeader('X-Filename', encodeURIComponent(file.name));
-            xhr.upload.addEventListener('progress', function (e) {
-                if (!e.lengthComputable) return;
-                currentLoaded = e.loaded;
-                var filePct = (e.loaded / e.total) * 100;
-                rows[i].fill.style.width = filePct + '%';
-                rows[i].pct.textContent = Math.round(filePct) + '%';
+            if (!failed) {
+                rows[i].fill.style.width = '100%';
+                rows[i].pct.textContent = 'Done';
+                rows[i].pct.className = 'progress-row-state ok';
+                bankedBytes = fileStartBanked + file.size;
                 updateOverall();
-            });
-            xhr.addEventListener('load', function () {
-                if (xhr.status >= 200 && xhr.status < 300) {
-                    rows[i].fill.style.width = '100%';
-                    rows[i].pct.textContent = 'Done';
-                    rows[i].pct.className = 'progress-row-state ok';
-                    uploadedBase += file.size;
-                    currentLoaded = 0;
-                    updateOverall();
-                    uploadOne(i + 1, 1);
-                } else {
-                    failedOrRetry('HTTP ' + xhr.status + ' ' + (xhr.responseText || ''));
-                }
-            });
-            xhr.addEventListener('error', function () {
-                failedOrRetry('network error');
-            });
-            xhr.send(file);
+            } else {
+                // Don't count a failed file's partial bytes toward the total.
+                bankedBytes = fileStartBanked;
+            }
         }
 
-        uploadOne(0, 1);
+        clearInterval(elapsedTimer);
+        overallEta.textContent = '--';
+        setTimeout(function () { location.reload(); }, 700);
     }
 })();
 "#;
@@ -1877,6 +1924,290 @@ where
         })
 }
 
+/// Maximum bytes accepted in a single chunk request. Generous headroom over
+/// the browser's own chunk size so a client-side tweak doesn't start getting
+/// rejected, while still bounding what one request can cost.
+const MAX_CHUNK_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Staging files older than this are assumed abandoned — the uploader closed
+/// the tab, or lost the network for good and never came back — and get swept.
+const STAGING_FILE_MAX_AGE_SECS: u64 = 24 * 60 * 60;
+
+fn share_chunk_staging_path(upload_id: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("td_share_chunk_{}.part", upload_id))
+}
+
+/// An upload id becomes part of a filesystem path, so it's validated rather
+/// than trusted: exactly 32 lowercase hex characters, which can't contain a
+/// path separator or `..`.
+fn validate_upload_id(upload_id: &str) -> Result<(), String> {
+    let well_formed = upload_id.len() == 32
+        && upload_id
+            .chars()
+            .all(|character| character.is_ascii_digit() || matches!(character, 'a'..='f'));
+    if well_formed {
+        Ok(())
+    } else {
+        Err("Upload id must be 32 lowercase hexadecimal characters".to_string())
+    }
+}
+
+/// Best-effort sweep of staging files left behind by uploads that never
+/// finished. Runs only when a fresh upload begins, so it costs nothing while
+/// the app sits idle.
+fn sweep_abandoned_staging_files() {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else { return };
+    let Some(cutoff) = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(STAGING_FILE_MAX_AGE_SECS))
+    else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with("td_share_chunk_") || !name.ends_with(".part") {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .map(|modified| modified < cutoff)
+            .unwrap_or(false);
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+            log::info!("Swept abandoned share-upload staging file {}", name);
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ChunkAccepted {
+    received: u64,
+    total: u64,
+}
+
+/// How many bytes of a given upload have already landed, so a browser that
+/// reloaded — or lost the network for a while — can pick up where it stopped
+/// instead of starting the file over.
+#[get("/s/{token}/files/chunk/{upload_id}")]
+async fn upload_chunk_status(
+    req: HttpRequest,
+    path: web::Path<(String, String)>,
+    db_conn: web::Data<DbConnection>,
+) -> impl Responder {
+    let (token, upload_id) = path.into_inner();
+    if let Err(response) =
+        authorize_folder_share(&req, &token, SharePermissions::UPLOAD, &db_conn).await
+    {
+        return response;
+    }
+    if let Err(error) = validate_upload_id(&upload_id) {
+        return HttpResponse::BadRequest().body(error);
+    }
+    let received = tokio::fs::metadata(share_chunk_staging_path(&upload_id))
+        .await
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    HttpResponse::Ok().json(serde_json::json!({ "received": received }))
+}
+
+/// Chunked, resumable upload — what the share page actually uses.
+///
+/// Sending a multi-GB file as ONE request means that single request has to
+/// survive the entire transfer. In practice it doesn't: a 4GB upload through
+/// the tunnel died with `ERR_CONNECTION_RESET` about a quarter of the way in,
+/// three attempts running, and because each retry restarted from zero it could
+/// never finish.
+///
+/// Here every chunk is its own short request, written into a staging file at an
+/// explicit byte offset, so a dropped chunk is retried on its own and
+/// everything already banked survives. The Telegram upload then happens once,
+/// at the end, reading from that staging file — which also earns it the
+/// per-part retry that only a re-readable local file allows (see
+/// `upload_stream_with_retry`), unlike a streamed body that can be read once.
+///
+/// Deliberately stateless: the staging file's own length IS the progress. No
+/// session table to leak or expire, and a desktop restart mid-upload doesn't
+/// throw away the bytes already written.
+#[post("/s/{token}/files/chunk")]
+async fn upload_file_chunk(
+    req: HttpRequest,
+    path: web::Path<String>,
+    mut payload: web::Payload,
+    db_conn: web::Data<DbConnection>,
+    tg_state: web::Data<Arc<TelegramState>>,
+    bw_manager: web::Data<Arc<BandwidthManager>>,
+    net_config: web::Data<Arc<NetworkConfig>>,
+) -> impl Responder {
+    let token = path.into_inner();
+    let row = match authorize_folder_share(&req, &token, SharePermissions::UPLOAD, &db_conn).await {
+        Ok(row) => row,
+        Err(response) => return response,
+    };
+
+    let header = |name: &str| -> Option<String> {
+        req.headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.to_string())
+    };
+
+    let Some(upload_id) = header("X-Upload-Id") else {
+        return HttpResponse::BadRequest().body("X-Upload-Id is required");
+    };
+    if let Err(error) = validate_upload_id(&upload_id) {
+        return HttpResponse::BadRequest().body(error);
+    }
+    let Some(offset) = header("X-Chunk-Offset").and_then(|value| value.parse::<u64>().ok()) else {
+        return HttpResponse::BadRequest().body("X-Chunk-Offset is required");
+    };
+    let Some(total_size) = header("X-Total-Size").and_then(|value| value.parse::<u64>().ok()) else {
+        return HttpResponse::BadRequest().body("X-Total-Size is required");
+    };
+    if total_size == 0 {
+        return HttpResponse::BadRequest().body("File is empty");
+    }
+    if total_size > MAX_SHARE_UPLOAD_BYTES {
+        return HttpResponse::PayloadTooLarge().body("File exceeds the maximum allowed size");
+    }
+    if offset > total_size {
+        return HttpResponse::BadRequest().body("Chunk offset is past the end of the file");
+    }
+
+    let filename = header("X-Filename")
+        .map(|raw| {
+            urlencoding::decode(&raw)
+                .map(|decoded| decoded.into_owned())
+                .unwrap_or(raw)
+        })
+        .map(|name| sanitize_filename(&name))
+        .unwrap_or_else(|| "file".to_string());
+
+    let staging_path = share_chunk_staging_path(&upload_id);
+    if offset == 0 {
+        sweep_abandoned_staging_files();
+    }
+
+    // A chunk may only start where the staged file currently ends (the next
+    // chunk) or earlier (a retry of one already applied). A gap would silently
+    // produce a corrupt file padded with zeroes, so it's refused and the client
+    // is told how far we actually got.
+    let existing_len = tokio::fs::metadata(&staging_path)
+        .await
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    if offset > existing_len {
+        return HttpResponse::Conflict().json(serde_json::json!({
+            "error": "chunk_out_of_order",
+            "received": existing_len,
+        }));
+    }
+
+    let mut file = match tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&staging_path)
+        .await
+    {
+        Ok(file) => file,
+        Err(error) => {
+            log::error!("Could not open share-upload staging file: {}", error);
+            return HttpResponse::InternalServerError().body("Could not stage upload");
+        }
+    };
+    if let Err(error) =
+        tokio::io::AsyncSeekExt::seek(&mut file, std::io::SeekFrom::Start(offset)).await
+    {
+        log::error!("Could not seek share-upload staging file: {}", error);
+        return HttpResponse::InternalServerError().body("Could not stage upload");
+    }
+
+    let mut written: u64 = 0;
+    while let Some(chunk) = payload.next().await {
+        let bytes = match chunk {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                // The common case this whole route exists for: the connection
+                // dropped mid-chunk. Only this chunk is lost; the client
+                // retries it against the offset still recorded on disk.
+                log::warn!(
+                    "Share upload {} chunk at offset {} aborted mid-transfer: {}",
+                    upload_id, offset, error
+                );
+                return HttpResponse::BadRequest().body(error.to_string());
+            }
+        };
+        written += bytes.len() as u64;
+        if written > MAX_CHUNK_BYTES || offset + written > total_size {
+            return HttpResponse::PayloadTooLarge().body("Chunk is larger than expected");
+        }
+        if let Err(error) = file.write_all(&bytes).await {
+            log::error!("Could not write share-upload chunk: {}", error);
+            return HttpResponse::InternalServerError().body("Could not stage upload");
+        }
+    }
+    if let Err(error) = file.flush().await {
+        log::error!("Could not flush share-upload chunk: {}", error);
+        return HttpResponse::InternalServerError().body("Could not stage upload");
+    }
+    // Truncate instead of leaving any longer tail behind, so the staged length
+    // stays an exact record of progress even when a retry rewrites in place.
+    let banked = offset + written;
+    if let Err(error) = file.set_len(banked).await {
+        log::error!("Could not truncate share-upload staging file: {}", error);
+        return HttpResponse::InternalServerError().body("Could not stage upload");
+    }
+    drop(file);
+
+    if banked < total_size {
+        return HttpResponse::Ok().json(ChunkAccepted { received: banked, total: total_size });
+    }
+
+    // The last chunk landed — hand the assembled file to Telegram.
+    log::info!(
+        "Share upload {} fully staged ({} bytes) — sending \"{}\" to Telegram",
+        upload_id, total_size, filename
+    );
+
+    let client_opt = { tg_state.client.lock().await.clone() };
+    let Some(client) = client_opt else {
+        return HttpResponse::ServiceUnavailable().body("Telegram client is not connected");
+    };
+    if let Err(error) = bw_manager.try_reserve_up(total_size) {
+        let _ = tokio::fs::remove_file(&staging_path).await;
+        return HttpResponse::BadRequest().body(error);
+    }
+    let peer = match resolve_peer(&client, row.folder_id, &tg_state.peer_cache).await {
+        Ok(peer) => peer,
+        Err(error) => {
+            bw_manager.release_up(total_size);
+            let _ = tokio::fs::remove_file(&staging_path).await;
+            return HttpResponse::InternalServerError().body(error);
+        }
+    };
+
+    let result = if split_file::should_split(total_size) {
+        send_split_file_to_telegram(&client, &peer, &net_config, filename, &staging_path, total_size)
+            .await
+    } else {
+        send_temp_file_to_telegram(&client, &peer, &net_config, filename, &staging_path, total_size)
+            .await
+    };
+    let _ = tokio::fs::remove_file(&staging_path).await;
+
+    match result {
+        Ok(message_id) => {
+            log::info!("Share upload {} completed as message {}", upload_id, message_id);
+            HttpResponse::Ok().json(serde_json::json!({ "message_id": message_id }))
+        }
+        Err(error) => {
+            bw_manager.release_up(total_size);
+            log::error!("Share upload {} failed sending to Telegram: {}", upload_id, error);
+            HttpResponse::InternalServerError().body(error)
+        }
+    }
+}
+
 /// "Update" replaces the content of a caller-specified `message_id` (the
 /// link holder discovers ids via the list route) rather than overwriting
 /// by filename, which would be ambiguous with duplicate names. The new
@@ -2018,7 +2349,60 @@ pub fn configure_folder_share_routes(cfg: &mut web::ServiceConfig) {
         .service(download_file)
         .service(download_file_thumbnail)
         .service(upload_file_streaming)
+        .service(upload_file_chunk)
+        .service(upload_chunk_status)
         .service(upload_file)
         .service(update_file)
         .service(delete_file);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upload_id_validation_accepts_only_the_generated_shape() {
+        assert!(validate_upload_id("a1b2c3d4e5f60718293a4b5c6d7e8f90").is_ok());
+        assert!(validate_upload_id("tooshort").is_err());
+        assert!(validate_upload_id("A1B2C3D4E5F60718293A4B5C6D7E8F90").is_err());
+        // 31 and 33 characters — an off-by-one must not slip through.
+        assert!(validate_upload_id("a1b2c3d4e5f60718293a4b5c6d7e8f9").is_err());
+        assert!(validate_upload_id("a1b2c3d4e5f60718293a4b5c6d7e8f900").is_err());
+    }
+
+    #[test]
+    fn upload_id_validation_blocks_path_traversal() {
+        // The id becomes part of a filesystem path, so anything that could
+        // escape the temp directory has to be refused outright.
+        for hostile in [
+            "../../../../etc/passwd",
+            "..\\..\\windows\\system32",
+            "a1b2c3d4e5f6/../../evil",
+            "a1b2c3d4e5f60718293a4b5c6d7e8f9/",
+            "....//....//abcdef01234567890abcdef0",
+        ] {
+            assert!(
+                validate_upload_id(hostile).is_err(),
+                "hostile upload id was accepted: {}",
+                hostile
+            );
+        }
+    }
+
+    #[test]
+    fn staging_path_stays_inside_the_temp_directory() {
+        let path = share_chunk_staging_path("a1b2c3d4e5f60718293a4b5c6d7e8f90");
+        assert!(path.starts_with(std::env::temp_dir()));
+        assert!(path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("td_share_chunk_") && name.ends_with(".part")));
+    }
+
+    #[test]
+    fn distinct_uploads_never_share_a_staging_file() {
+        let first = share_chunk_staging_path("a1b2c3d4e5f60718293a4b5c6d7e8f90");
+        let second = share_chunk_staging_path("00000000000000000000000000000000");
+        assert_ne!(first, second);
+    }
 }

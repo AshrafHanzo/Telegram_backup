@@ -1,3 +1,18 @@
+## [Unreleased]
+
+### Large uploads through a Temp Link
+
+- Share-page uploads are now sent in chunks instead of one long request. A multi-GB upload previously had to keep a single connection alive for the whole transfer, and over a mobile connection it did not — a 4GB upload reset roughly a quarter of the way through on three attempts in a row, and because each retry restarted from the beginning it could never finish. A dropped chunk is now retried on its own and the bytes already transferred are kept.
+- An interrupted upload can resume: the server reports how much it has staged, so the browser continues from there rather than starting over.
+
+### Diagnostics
+
+- Logs are now written to a rotating file in the app's log directory instead of only to a terminal that a windowed app never has, so failures can actually be investigated after the fact.
+
+### Fixes
+
+- Fixed stray Command Prompt windows appearing beside the app on Windows. Every helper process it launches (the Cloudflare tunnel, ffmpeg, ipconfig) is a console program, and the tunnel's restart loop kept adding more windows over time.
+
 ## [3.0.1] - 2026-08-18
 
 ### Fixes
