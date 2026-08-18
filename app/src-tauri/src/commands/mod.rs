@@ -63,6 +63,7 @@ pub mod totp;
 pub mod notifications;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub mod autostart;
+pub mod share_domain;
 
 pub use auth::*;
 pub use fs::*;

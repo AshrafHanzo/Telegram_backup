@@ -29,6 +29,11 @@ use tokio::process::Command;
 
 pub struct TunnelState {
     public_url: Arc<StdMutex<Option<String>>>,
+    /// A hostname the user configured themselves, pointing at their own named
+    /// tunnel (see `commands::share_domain`). Takes precedence over anything a
+    /// quick tunnel reports, and is never cleared when cloudflared exits —
+    /// it's a setting, not an observation.
+    fixed_url: Arc<StdMutex<Option<String>>>,
     /// When the folder-share list was last republished for mobile, used to
     /// rate-limit that publication — see `republish_shares_for_mobile`.
     last_share_publish: Arc<StdMutex<Option<std::time::Instant>>>,
@@ -38,14 +43,33 @@ impl TunnelState {
     pub fn new() -> Self {
         Self {
             public_url: Arc::new(StdMutex::new(None)),
+            fixed_url: Arc::new(StdMutex::new(None)),
             last_share_publish: Arc::new(StdMutex::new(None)),
         }
     }
 
-    /// The current public base URL (e.g. `https://random-words.trycloudflare.com`),
-    /// or `None` if the tunnel hasn't come up yet (or failed to start at all).
+    /// The public base URL links are built from: the configured hostname if
+    /// there is one, otherwise whatever the quick tunnel last reported, or
+    /// `None` if neither is available (callers then fall back to loopback).
     pub fn base_url(&self) -> Option<String> {
+        if let Some(fixed) = self.fixed_url.lock().ok().and_then(|guard| guard.clone()) {
+            return Some(fixed);
+        }
         self.public_url.lock().ok().and_then(|guard| guard.clone())
+    }
+
+    /// Replaces the configured hostname. `None` restores automatic behaviour.
+    pub fn set_fixed_url(&self, url: Option<String>) {
+        if let Ok(mut guard) = self.fixed_url.lock() {
+            *guard = url;
+        }
+    }
+
+    pub fn has_fixed_url(&self) -> bool {
+        self.fixed_url
+            .lock()
+            .map(|guard| guard.is_some())
+            .unwrap_or(false)
     }
 }
 
@@ -199,6 +223,18 @@ fn extract_tunnel_url(line: &str) -> Option<String> {
 /// permanently unavailable until the next full app restart.
 pub fn start(app: AppHandle, local_port: u16, state: Arc<TunnelState>) {
     tauri::async_runtime::spawn(async move {
+        // Someone running their own named tunnel already has a stable public
+        // hostname, so there is nothing to stand up here. Starting a quick
+        // tunnel anyway would burn a second connection to the same port and
+        // hand back a random host that changes on every respawn — the exact
+        // problem configuring a hostname is meant to solve.
+        if state.has_fixed_url() {
+            if let Some(url) = state.base_url() {
+                log::info!("Temp Links using the configured public address {}", url);
+            }
+            republish_shares_for_mobile(&app, &state).await;
+            return;
+        }
         // Binary resolution failing (download blocked, no network at all)
         // is much less likely to change moment-to-moment than a running
         // tunnel process exiting, so it gets a longer backoff — no point

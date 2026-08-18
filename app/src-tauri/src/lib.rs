@@ -889,6 +889,12 @@ pub fn run() {
             #[cfg(not(target_os = "android"))]
             {
                 let tunnel_state = Arc::new(tunnel::TunnelState::new());
+                // Load this before starting the tunnel: with an address
+                // configured, `tunnel::start` skips standing up a quick tunnel
+                // entirely rather than racing it.
+                tunnel_state.set_fixed_url(
+                    commands::share_domain::load_settings(app.handle()).base_url,
+                );
                 app.manage(tunnel_state.clone());
                 tunnel::start(app.handle().clone(), STREAM_PORT, tunnel_state);
             }
@@ -1097,6 +1103,8 @@ pub fn run() {
             commands::cmd_get_api_settings,
             commands::cmd_update_api_settings,
             commands::cmd_regenerate_api_key,
+            commands::share_domain::cmd_get_share_domain,
+            commands::share_domain::cmd_set_share_domain,
             commands::webdav_settings::cmd_get_webdav_settings,
             commands::webdav_settings::cmd_update_webdav_settings,
             commands::webdav_settings::cmd_regenerate_webdav_token,

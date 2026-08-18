@@ -479,6 +479,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
  "unrar",
+ "url",
  "urlencoding",
  "walkdir",
  "webpki-roots 0.26.11",
