@@ -919,6 +919,14 @@ const UPLOAD_SCRIPT_TEMPLATE: &str = r#"
 
         for (var i = 0; i < files.length; i++) {
             var file = files[i];
+            // A zero-byte file would skip the chunk loop below entirely and
+            // report success without ever reaching the server (which rejects
+            // empty uploads anyway), so it's called out instead.
+            if (file.size === 0) {
+                rows[i].pct.textContent = 'Empty';
+                rows[i].pct.className = 'progress-row-state fail';
+                continue;
+            }
             var uploadId = randomUploadId();
             var offset = 0;
             var attempts = 0;
