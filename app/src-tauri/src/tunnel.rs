@@ -76,7 +76,12 @@ const CLOUDFLARED_FILENAME: &str = "cloudflared";
 /// Resolves a usable `cloudflared` binary: reuse one already on PATH, reuse a
 /// previously downloaded copy in the app's data dir, or download a fresh one.
 async fn resolve_binary(app: &AppHandle) -> Result<PathBuf, String> {
-    if let Ok(status) = Command::new("cloudflared").arg("--version").status().await {
+    let mut probe = Command::new("cloudflared");
+    probe.arg("--version");
+    // Without this the probe flashes a console window on every launch.
+    #[cfg(windows)]
+    probe.creation_flags(crate::CREATE_NO_WINDOW);
+    if let Ok(status) = probe.status().await {
         if status.success() {
             return Ok(PathBuf::from("cloudflared"));
         }
@@ -215,16 +220,21 @@ pub fn start(app: AppHandle, local_port: u16, state: Arc<TunnelState>) {
         };
 
         loop {
-            let mut child = match Command::new(&binary)
+            let mut command = Command::new(&binary);
+            command
                 .arg("tunnel")
                 .arg("--url")
                 .arg(format!("http://127.0.0.1:{}", local_port))
                 .arg("--no-autoupdate")
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()
-            {
+                .kill_on_drop(true);
+            // The tunnel is a long-lived background helper; the respawn loop
+            // below would otherwise stack up a visible console window per
+            // restart.
+            #[cfg(windows)]
+            command.creation_flags(crate::CREATE_NO_WINDOW);
+            let mut child = match command.spawn() {
                 Ok(child) => child,
                 Err(error) => {
                     log::warn!(

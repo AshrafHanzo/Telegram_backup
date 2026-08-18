@@ -84,6 +84,8 @@ pub async fn run_fmp4_remux(
     }
 
     let mut cmd = tokio::process::Command::new(ffmpeg_path);
+    #[cfg(windows)]
+    cmd.creation_flags(crate::CREATE_NO_WINDOW);
     cmd.arg("-y") // Overwrite existing output
         .arg("-i")
         .arg(input_path)

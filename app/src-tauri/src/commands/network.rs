@@ -287,7 +287,10 @@ pub async fn cmd_detect_vpn() -> Result<bool, String> {
         #[cfg(target_os = "windows")]
         {
             // Windows: run ipconfig and check output for common VPN adapter keywords
-            match std::process::Command::new("ipconfig")
+            let mut ipconfig = std::process::Command::new("ipconfig");
+            #[cfg(windows)]
+            std::os::windows::process::CommandExt::creation_flags(&mut ipconfig, crate::CREATE_NO_WINDOW);
+            match ipconfig
                 .output()
             {
                 Ok(output) => {

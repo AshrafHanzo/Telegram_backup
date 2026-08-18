@@ -436,7 +436,10 @@ pub async fn detect_ffmpeg(app_handle: &tauri::AppHandle) -> Option<PathBuf> {
 }
 
 async fn test_ffmpeg(path: &Path) -> Result<bool, String> {
-    let output = tokio::process::Command::new(path)
+    let mut probe = tokio::process::Command::new(path);
+    #[cfg(windows)]
+    probe.creation_flags(crate::CREATE_NO_WINDOW);
+    let output = probe
         .arg("-version")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -553,6 +556,8 @@ pub async fn run_transcode(
     let segment_pattern = output_dir.join("segment_%03d.ts");
 
     let mut cmd = tokio::process::Command::new(ffmpeg_path);
+    #[cfg(windows)]
+    cmd.creation_flags(crate::CREATE_NO_WINDOW);
     cmd.arg("-y") // Overwrite
         .arg("-i").arg(input_path)
         // Explicit stream mapping: first video, optional audio, no subtitles/data

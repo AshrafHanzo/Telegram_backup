@@ -83,6 +83,16 @@ pub mod crypto_commands;
 /// via cmd_get_stream_info so no component ever hardcodes the port.
 pub const STREAM_PORT: u16 = 14201;
 
+/// Windows `CREATE_NO_WINDOW` process-creation flag.
+///
+/// Every helper this app shells out to (`cloudflared`, `ffmpeg`, `ipconfig`)
+/// is a console program, and Windows gives a console program its own visible
+/// console window by default — so launching the app popped stray "Command
+/// Prompt" windows next to it, and the tunnel's respawn loop kept adding
+/// more. Passing this flag keeps those children headless.
+#[cfg(windows)]
+pub(crate) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 /// Generate a random 32-character hex token for streaming server auth
 fn generate_stream_token() -> String {
     let mut rng = rand::rng();
