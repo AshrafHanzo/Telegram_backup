@@ -1,4 +1,4 @@
-## [Unreleased]
+## [3.1.0] - 2026-08-19
 
 ### Large uploads through a Temp Link
 

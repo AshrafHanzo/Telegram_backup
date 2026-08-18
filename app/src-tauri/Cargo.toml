@@ -1,6 +1,6 @@
 [package]
 name = "app"
-version = "3.0.1"
+version = "3.1.0"
 description = "Turn your Telegram account into an unlimited, secure cloud storage drive. an Open-source desktop app built with Tauri, Rust, and React."
 edition = "2021"
 default-run = "app"
