@@ -1,3 +1,9 @@
+## [Unreleased]
+
+### Integrity
+
+- Share uploads now record a SHA-256 of the file as it is sent to Telegram, so a download can be checked against what was actually uploaded. For files split across multiple parts the digest is stored in the manifest; every share upload also reports it on completion. Desktop uploads and the fallback upload path do not record one yet — a manifest without a digest is treated as unverifiable rather than assumed good.
+
 ## [3.2.0] - 2026-08-19
 
 ### Temp Link uploads

@@ -1750,6 +1750,10 @@ async fn send_split_file_to_telegram(
         size,
         part_count: part_count as u32,
         part_ids,
+        // No digest on this path: each part is re-read from disk on retry, so a
+        // running hash would double-count. Recorded as absent rather than
+        // wrong — a manifest without one is simply not verifiable.
+        sha256: None,
     };
     let manifest_message = InputMessage::new().text(split_file::manifest_text(&manifest)?);
     send_message_with_retry(client, peer, manifest_message, net_config)
@@ -1909,7 +1913,8 @@ async fn upload_file_streaming(
     };
 
     match result {
-        Ok(message_id) => HttpResponse::Ok().json(serde_json::json!({ "message_id": message_id })),
+        Ok((message_id, sha256)) => HttpResponse::Ok()
+            .json(serde_json::json!({ "message_id": message_id, "sha256": sha256 })),
         Err(error) => {
             bw_manager.release_up(size);
             HttpResponse::InternalServerError().body(error)
@@ -1924,16 +1929,22 @@ async fn stream_single_file_to_telegram<R>(
     filename: String,
     reader: &mut R,
     size: u64,
-) -> Result<i32, String>
+) -> Result<(i32, String), String>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
+    // Hashed on the way out, so the digest describes exactly the bytes Telegram
+    // received rather than what we believe we staged.
+    let mut hashing = crate::share_upload_pipeline::HashingReader::new(reader);
+    let digest_handle = hashing.digest_handle();
     let uploaded_file = client
-        .upload_stream(reader, size as usize, filename)
+        .upload_stream(&mut hashing, size as usize, filename)
         .await
         .map_err(map_error)?;
     let message = InputMessage::new().text("").file(uploaded_file);
-    send_message_with_retry(client, peer, message, net_config).await
+    let message_id = send_message_with_retry(client, peer, message, net_config).await?;
+    let digest = crate::share_upload_pipeline::finish_digest(&digest_handle).unwrap_or_default();
+    Ok((message_id, digest))
 }
 
 /// Splits a streamed upload across multiple part messages (see `split_file`)
@@ -1947,18 +1958,21 @@ async fn stream_split_file_to_telegram<R>(
     filename: String,
     reader: &mut R,
     size: u64,
-) -> Result<i32, String>
+) -> Result<(i32, String), String>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
     use tokio::io::AsyncReadExt;
+
+    let mut hashing = crate::share_upload_pipeline::HashingReader::new(reader);
+    let digest_handle = hashing.digest_handle();
 
     let ranges = split_file::part_ranges(size);
     let part_count = ranges.len();
     let mut part_ids: Vec<i32> = Vec::with_capacity(part_count);
 
     for (index, (_, len)) in ranges.iter().enumerate() {
-        let mut part = (&mut *reader).take(*len);
+        let mut part = (&mut hashing).take(*len);
         let uploaded_file = client
             .upload_stream(&mut part, *len as usize, format!("part{:04}", index + 1))
             .await
@@ -1981,22 +1995,27 @@ where
         }
     }
 
+    // Every part has been read by now, so this covers the whole file.
+    let digest = crate::share_upload_pipeline::finish_digest(&digest_handle).unwrap_or_default();
     let manifest = split_file::SplitManifest {
         schema_version: 1,
         name: filename,
         size,
         part_count: part_count as u32,
         part_ids,
+        sha256: Some(digest.clone()),
     };
     let manifest_text = split_file::manifest_text(&manifest)?;
-    send_message_with_retry(client, peer, InputMessage::new().text(manifest_text), net_config)
-        .await
-        .map_err(|error| {
-            format!(
-                "All {} parts uploaded, but the manifest failed to send: {}",
-                part_count, error
-            )
-        })
+    let message_id =
+        send_message_with_retry(client, peer, InputMessage::new().text(manifest_text), net_config)
+            .await
+            .map_err(|error| {
+                format!(
+                    "All {} parts uploaded, but the manifest failed to send: {}",
+                    part_count, error
+                )
+            })?;
+    Ok((message_id, digest))
 }
 
 /// Maximum bytes accepted in a single chunk request. Generous headroom over
@@ -2176,9 +2195,9 @@ async fn start_pipelined_upload(
             )),
         };
         match &result {
-            Ok(message_id) => log::info!(
-                "Share upload {} sent to Telegram as message {} while still uploading",
-                id, message_id
+            Ok((message_id, sha256)) => log::info!(
+                "Share upload {} sent to Telegram as message {} while still uploading, sha256 {}",
+                id, message_id, sha256
             ),
             Err(error) => {
                 // Not fatal, and deliberately leaves the staging file alone:
@@ -2388,15 +2407,16 @@ async fn upload_file_chunk(
         if !pipeline.has_failed() {
             pipeline.finish_feeding().await;
             match pipeline.wait_for_outcome().await {
-                Ok(message_id) => {
+                Ok((message_id, sha256)) => {
                     crate::share_upload_pipeline::forget(&upload_id);
                     let _ = tokio::fs::remove_file(&staging_path).await;
                     log::info!(
-                        "Share upload {} completed as message {} (pipelined)",
-                        upload_id, message_id
+                        "Share upload {} completed as message {} (pipelined), sha256 {}",
+                        upload_id, message_id, sha256
                     );
-                    return HttpResponse::Ok()
-                        .json(serde_json::json!({ "message_id": message_id }));
+                    return HttpResponse::Ok().json(
+                        serde_json::json!({ "message_id": message_id, "sha256": sha256 }),
+                    );
                 }
                 Err(error) => log::warn!(
                     "Share upload {} falling back to sending the staged file: {}",

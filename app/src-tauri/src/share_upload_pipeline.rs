@@ -53,7 +53,7 @@ pub struct PipelinedUpload {
     /// feeding a pipeline nothing is draining.
     failed: AtomicBool,
     sender: Mutex<Option<mpsc::Sender<io::Result<bytes::Bytes>>>>,
-    outcome: Mutex<Option<Result<i32, String>>>,
+    outcome: Mutex<Option<Result<(i32, String), String>>>,
     finished: Notify,
 }
 
@@ -122,8 +122,9 @@ impl PipelinedUpload {
         self.sender.lock().await.take();
     }
 
-    /// Waits for the Telegram side to finish and returns the message id.
-    pub async fn wait_for_outcome(&self) -> Result<i32, String> {
+    /// Waits for the Telegram side to finish, returning the message id and the
+    /// SHA-256 of everything that was sent.
+    pub async fn wait_for_outcome(&self) -> Result<(i32, String), String> {
         loop {
             // Register interest before checking, so an outcome stored between
             // the check and the wait can't be missed.
@@ -135,7 +136,7 @@ impl PipelinedUpload {
         }
     }
 
-    pub async fn store_outcome(&self, outcome: Result<i32, String>) {
+    pub async fn store_outcome(&self, outcome: Result<(i32, String), String>) {
         if outcome.is_err() {
             self.mark_failed();
         }
@@ -323,8 +324,8 @@ mod tests {
         // Guards the ordering bug this is easy to write: if the waiter checked
         // after registering interest it would hang on an already-finished job.
         let (upload, _reader) = create(1);
-        upload.store_outcome(Ok(42)).await;
-        assert_eq!(upload.wait_for_outcome().await, Ok(42));
+        upload.store_outcome(Ok((42, "abc".to_string()))).await;
+        assert_eq!(upload.wait_for_outcome().await, Ok((42, "abc".to_string())));
     }
 
     #[tokio::test]
@@ -342,7 +343,101 @@ mod tests {
         let handle = tokio::spawn(async move { waiter.wait_for_outcome().await });
         // Give the waiter a chance to park before the outcome is stored.
         tokio::task::yield_now().await;
-        upload.store_outcome(Ok(7)).await;
-        assert_eq!(handle.await.unwrap(), Ok(7));
+        upload.store_outcome(Ok((7, "def".to_string()))).await;
+        assert_eq!(handle.await.unwrap(), Ok((7, "def".to_string())));
+    }
+}
+
+/// Wraps a reader so every byte that passes through is hashed.
+///
+/// Placed here rather than at the point bytes are received because this is the
+/// last thing they pass through before Telegram: it hashes what was actually
+/// uploaded, which is what a download can later be checked against. It also
+/// covers the overlap handling above — if the wrong bytes were ever forwarded,
+/// this digest stops matching the file the uploader sent.
+pub struct HashingReader<R> {
+    inner: R,
+    digest: Arc<std::sync::Mutex<sha2::Sha256>>,
+}
+
+impl<R> HashingReader<R> {
+    pub fn new(inner: R) -> Self {
+        use sha2::Digest;
+        Self {
+            inner,
+            digest: Arc::new(std::sync::Mutex::new(sha2::Sha256::new())),
+        }
+    }
+
+    /// Handle to read the digest from once the reader has been consumed.
+    pub fn digest_handle(&self) -> Arc<std::sync::Mutex<sha2::Sha256>> {
+        self.digest.clone()
+    }
+}
+
+/// Hex-encoded digest of everything hashed so far.
+pub fn finish_digest(handle: &Arc<std::sync::Mutex<sha2::Sha256>>) -> Option<String> {
+    use sha2::Digest;
+    let guard = handle.lock().ok()?;
+    Some(format!("{:x}", guard.clone().finalize()))
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for HashingReader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        use sha2::Digest;
+        let before = buf.filled().len();
+        let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if matches!(result, Poll::Ready(Ok(()))) {
+            let fresh = &buf.filled()[before..];
+            if !fresh.is_empty() {
+                if let Ok(mut guard) = self.digest.lock() {
+                    guard.update(fresh);
+                }
+            }
+        }
+        result
+    }
+}
+
+#[cfg(test)]
+mod hashing_tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn the_digest_matches_hashing_the_same_bytes_directly() {
+        use sha2::Digest;
+        let data = b"the quick brown fox jumps over the lazy dog".repeat(1000);
+        let mut reader = HashingReader::new(&data[..]);
+        let handle = reader.digest_handle();
+
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).await.unwrap();
+
+        assert_eq!(out, data);
+        let expected = format!("{:x}", sha2::Sha256::digest(&data));
+        assert_eq!(finish_digest(&handle).unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn a_digest_read_early_covers_only_what_was_read() {
+        // Reading the handle before the reader is drained must not silently
+        // report the whole-file digest, or a partial upload could be recorded
+        // as verified.
+        use sha2::Digest;
+        let data = vec![7u8; 4096];
+        let mut reader = HashingReader::new(&data[..]);
+        let handle = reader.digest_handle();
+
+        let mut head = vec![0u8; 1024];
+        reader.read_exact(&mut head).await.unwrap();
+
+        let partial = finish_digest(&handle).unwrap();
+        assert_eq!(partial, format!("{:x}", sha2::Sha256::digest(&data[..1024])));
+        assert_ne!(partial, format!("{:x}", sha2::Sha256::digest(&data)));
     }
 }

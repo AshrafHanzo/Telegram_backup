@@ -54,6 +54,12 @@ pub(crate) struct SplitManifest {
     pub size: u64,
     pub part_count: u32,
     pub part_ids: Vec<i32>,
+    /// SHA-256 of the whole reassembled file, hex encoded, so a download can be
+    /// checked against what was actually uploaded. Optional because manifests
+    /// written before this existed don't carry one — those still parse and are
+    /// simply not verifiable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
 
 /// Parses a message's text as a split-file manifest, if it is one. Returns
@@ -190,6 +196,7 @@ mod tests {
     #[test]
     fn manifest_round_trips_through_parse() {
         let manifest = SplitManifest {
+            sha256: None,
             schema_version: 1,
             name: "movie.mkv".to_string(),
             size: 5_000_000_000,

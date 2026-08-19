@@ -1663,6 +1663,10 @@ async fn upload_split_file(
         size,
         part_count: part_count as u32,
         part_ids,
+        // Desktop uploads read each part from the local file and re-read it on
+        // retry, so a running hash would double-count. Left absent rather than
+        // recorded wrong; only share uploads carry a digest today.
+        sha256: None,
     };
     let manifest_message = InputMessage::new().text(split_file::manifest_text(&manifest)?);
     let sent = send_with_retry(
