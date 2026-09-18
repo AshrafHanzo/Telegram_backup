@@ -300,7 +300,7 @@ If you are the original author and want this fork taken down, renamed, or relice
 Infrastructure only — so that builds from this repository do not depend on, or impersonate, anyone else's release channel:
 
 - Updater endpoint repointed to this repository's releases.
-- Updater signing key replaced with this fork's own key (`46666847257B495F`).
+- Updater signing key replaced with this fork's own key (`D7E005695F187AC2`).
 - Bundle identifier changed to `com.ashrafhanzo.telegramdrive`.
 - Upstream donation links and funding config removed, rather than collecting on the original author's behalf.
 

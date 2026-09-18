@@ -24,7 +24,7 @@ Changes made in this fork are infrastructure only, so that builds produced
 here do not depend on, or impersonate, another party's release channel:
 
   - Updater endpoint repointed to this fork's own releases.
-  - Updater signing key replaced with this fork's own key (46666847257B495F).
+  - Updater signing key replaced with this fork's own key (D7E005695F187AC2).
   - Bundle identifier changed to com.ashrafhanzo.telegramdrive.
   - Upstream donation links and funding configuration removed.
 
