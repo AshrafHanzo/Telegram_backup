@@ -6,14 +6,14 @@
     },
     "updater": {
       "endpoints": [
-        "https://github.com/MageshwarSV/Telegram-drive/releases/latest/download/latest.json"
+        "https://github.com/AshrafHanzo/Telegram_backup/releases/latest/download/latest.json"
       ],
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDgwMjZCRTNEQzA2OUFGODUKUldTRnIybkFQYjRtZ0dxVFB1ZnlBWjA1a2FRSUR0WjJPMVI5RHc2MW95ZGl2UVkzL0ZaL0R6dGEK"
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ2NjY2ODQ3MjU3QjQ5NUYKUldSZlNYc2xSMmhtUnRsSGFRZmt2R3Uwb2ZVNlpQb0w4amVUcjJJcUVuZ3hkaUpXM0ZJRFhYTk8K"
     }
   },
   "productName": "Telegram Drive",
   "version": "3.2.0",
-  "identifier": "com.cameronamer.telegramdrive",
+  "identifier": "com.ashrafhanzo.telegramdrive",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -34,7 +34,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; connect-src 'self' https: http://localhost:* https://asset.localhost http://asset.localhost; media-src 'self' blob: http://localhost:*; img-src 'self' data: blob: asset: https: https://asset.localhost http://asset.localhost; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' 'unsafe-eval' blob: https:; frame-src 'self' blob: https: https://www.cameronamer.com http://localhost:* http://127.0.0.1:*; worker-src 'self' blob:;",
+      "csp": "default-src 'self'; connect-src 'self' https: http://localhost:* https://asset.localhost http://asset.localhost; media-src 'self' blob: http://localhost:*; img-src 'self' data: blob: asset: https: https://asset.localhost http://asset.localhost; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' 'unsafe-eval' blob: https:; frame-src 'self' blob: https: http://localhost:* http://127.0.0.1:*; worker-src 'self' blob:;",
       "assetProtocol": {
         "enable": true,
         "scope": [

@@ -828,6 +828,7 @@ export default function MobileDashboard({ onLogout }: { onLogout?: () => void })
                 <div className="w-10 h-px bg-telegram-border" />
 
                 <div className="text-center space-y-2.5">
+                  <p className="text-[10px] uppercase tracking-wide text-telegram-subtext/70">Originally created by</p>
                   <p className="text-xs font-semibold text-telegram-text">Cameron Amer</p>
 
                   <button
@@ -847,6 +848,17 @@ export default function MobileDashboard({ onLogout }: { onLogout?: () => void })
                     </svg>
                     github.com/caamer20/telegram-drive
                   </button>
+
+                  <div className="pt-2 border-t border-telegram-border/40">
+                    <p className="text-[10px] uppercase tracking-wide text-telegram-subtext/70">This fork maintained by</p>
+                    <p className="text-xs font-semibold text-telegram-text">Ashraf</p>
+                    <button
+                      onClick={(e) => { e.preventDefault(); openUrl('https://github.com/AshrafHanzo/Telegram_backup'); }}
+                      className="mx-auto mt-1 flex items-center justify-center gap-1.5 text-[11px] text-telegram-primary hover:text-telegram-primary/80 transition-colors cursor-pointer"
+                    >
+                      github.com/AshrafHanzo/Telegram_backup
+                    </button>
+                  </div>
                 </div>
 
                 <p className="text-[10px] text-telegram-subtext/60 leading-relaxed text-center px-2">

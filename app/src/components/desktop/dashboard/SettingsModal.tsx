@@ -3562,9 +3562,11 @@ export function SettingsModal({ isOpen, onClose, folders = [] }: SettingsModalPr
                                                 {t('settings.copy_diagnostics')}
                                             </button>
 
-                                            {/* Creator Info */}
+                                            {/* Creator Info — upstream authorship, kept intact.
+                                                This build is a fork; see the maintainer line below. */}
                                             <div className="text-center space-y-3">
                                                 <div>
+                                                    <p className="text-[11px] uppercase tracking-wide text-telegram-subtext/70">Originally created by</p>
                                                     <p className="text-sm font-semibold text-telegram-text">Cameron Amer</p>
                                                 </div>
 
@@ -3587,6 +3589,18 @@ export function SettingsModal({ isOpen, onClose, folders = [] }: SettingsModalPr
                                                     </svg>
                                                     github.com/caamer20/telegram-drive
                                                 </button>
+
+                                                {/* Fork maintainer */}
+                                                <div className="pt-2 border-t border-telegram-border/40">
+                                                    <p className="text-[11px] uppercase tracking-wide text-telegram-subtext/70">This fork maintained by</p>
+                                                    <p className="text-sm font-semibold text-telegram-text">Ashraf</p>
+                                                    <button
+                                                        onClick={(e) => { e.preventDefault(); open('https://github.com/AshrafHanzo/Telegram_backup'); }}
+                                                        className="mx-auto mt-1 flex items-center justify-center gap-1.5 text-xs text-telegram-primary hover:text-telegram-primary/80 transition-colors cursor-pointer"
+                                                    >
+                                                        github.com/AshrafHanzo/Telegram_backup
+                                                    </button>
+                                                </div>
                                             </div>
 
                                             {/* Tagline */}

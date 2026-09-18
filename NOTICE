@@ -1,0 +1,60 @@
+Telegram Drive
+==============
+
+Original author
+---------------
+
+Telegram Drive was created by Cameron Amer.
+
+    Upstream project: https://github.com/caamer20/Telegram-Drive
+    Author website:   https://www.cameronamer.com
+
+The first commit in this repository's history (705fe39, 2026-01-23,
+"Initial commit of Telegram Drive") is Cameron Amer's. This fork preserves
+the upstream commit history rather than squashing or rewriting it, so
+authorship of every original commit remains attributable.
+
+
+This fork
+---------
+
+Maintained by Ashraf — https://github.com/AshrafHanzo/Telegram_backup
+
+Changes made in this fork are infrastructure only, so that builds produced
+here do not depend on, or impersonate, another party's release channel:
+
+  - Updater endpoint repointed to this fork's own releases.
+  - Updater signing key replaced with this fork's own key (46666847257B495F).
+  - Bundle identifier changed to com.ashrafhanzo.telegramdrive.
+  - Upstream donation links and funding configuration removed.
+
+Original authorship credit in the application's About screen is preserved.
+
+
+License status
+--------------
+
+This project does not carry a license.
+
+The only LICENSE file in this tree is mobile/LICENSE, which is the MIT
+license of 650 Industries, Inc. (Expo) and covers Expo's template code
+only. It does not grant any rights over Telegram Drive itself.
+
+Code published without a license reserves all rights to its author by
+default. No permission to copy, modify, or redistribute Telegram Drive has
+been granted by its author in this repository. Anyone intending to
+redistribute builds of this software should obtain an explicit license from
+Cameron Amer first.
+
+If you are the original author and want this fork taken down, renamed, or
+relicensed, please open an issue on the fork and it will be actioned.
+
+
+Third-party components
+----------------------
+
+This application bundles numerous third-party open source components under
+their own licenses, including Expo (MIT, see mobile/LICENSE), and the Rust
+and npm dependency graphs declared in app/src-tauri/Cargo.toml,
+app/package.json, and mobile/package.json. Consult those manifests and their
+respective upstream projects for applicable license terms.

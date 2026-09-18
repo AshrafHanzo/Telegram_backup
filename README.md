@@ -7,12 +7,15 @@ The application is built with Tauri, Rust, React, and TypeScript.
 <div align="center">
 
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20Android-blue)]()
-![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/caamer20/Telegram-Drive/total?style=flat)
-[![oosmetrics](https://api.oosmetrics.com/api/v1/badge/achievement/ae8e5a6b-e815-4799-a408-4a59980cf9c8.svg)](https://oosmetrics.com/repo/caamer20/Telegram-Drive)
-[![oosmetrics](https://api.oosmetrics.com/api/v1/badge/achievement/029fb97b-a54a-4566-a1eb-aa1a5039065d.svg)](https://oosmetrics.com/repo/caamer20/Telegram-Drive)
-[![oosmetrics](https://api.oosmetrics.com/api/v1/badge/achievement/2aa6f3f9-fd8a-4523-bd73-6625ee6a948a.svg)](https://oosmetrics.com/repo/caamer20/Telegram-Drive)
+![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/AshrafHanzo/Telegram_backup/total?style=flat)
 
 </div>
+
+> [!IMPORTANT]
+> This repository is a **fork**. Telegram Drive was created by **Cameron Amer**
+> ([caamer20/Telegram-Drive](https://github.com/caamer20/Telegram-Drive)). This fork is
+> maintained by Ashraf. See [Attribution and license status](#attribution-and-license-status)
+> before redistributing anything from here.
 
 ## How Telegram Drive works
 
@@ -239,8 +242,8 @@ Common platform requirements:
 ### Install and run
 
 ```bash
-git clone https://github.com/caamer20/Telegram-Drive.git
-cd Telegram-Drive/app
+git clone https://github.com/AshrafHanzo/Telegram_backup.git
+cd Telegram_backup/app
 npm install
 npm run tauri dev
 ```
@@ -279,9 +282,29 @@ cd src-tauri && cargo test --lib
 - [Encryption execution report](ENCRYPTION_REMEDIATION_EXECUTION_REPORT.md)
 - [TDENC2 architecture decision](app/docs/adr/ADR-0002-encrypted-file-envelope-v2.md)
 
-## License status
+## Attribution and license status
 
-This checkout does not currently contain a `LICENSE` file. Earlier README versions described the project as MIT-licensed, but that statement cannot be verified from the repository contents. The intended license should be added as a repository license file before users rely on a particular grant of permission for copying, modification, or redistribution.
+Telegram Drive was created by **Cameron Amer** ([caamer20/Telegram-Drive](https://github.com/caamer20/Telegram-Drive)). The commit history in this repository preserves the original authorship — the first commit, `705fe39`, is Cameron Amer's. This fork keeps that history intact rather than squashing it.
+
+**This project has no license file, and that is a real constraint.** The only `LICENSE` in the tree is [mobile/LICENSE](mobile/LICENSE), which is Expo's MIT license covering Expo's own template code — it does not cover Telegram Drive. Under default copyright law, code published without a license grants no permission to copy, modify, or redistribute it.
+
+In practice that means:
+
+- Using and modifying this fork privately is low-risk and normal.
+- **Publicly redistributing builds, or presenting this work as originally your own, is not covered by any grant of permission.** Anyone wanting to do that should ask Cameron Amer for an explicit license first.
+
+If you are the original author and want this fork taken down, renamed, or relicensed, open an issue and it will be actioned.
+
+### What this fork changed
+
+Infrastructure only — so that builds from this repository do not depend on, or impersonate, anyone else's release channel:
+
+- Updater endpoint repointed to this repository's releases.
+- Updater signing key replaced with this fork's own key (`46666847257B495F`).
+- Bundle identifier changed to `com.ashrafhanzo.telegramdrive`.
+- Upstream donation links and funding config removed, rather than collecting on the original author's behalf.
+
+Original authorship credit in the app's About screen is deliberately preserved.
 
 ---
 

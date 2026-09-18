@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { motion, AnimatePresence } from "framer-motion";
-import { Phone, Key, Lock, ArrowRight, Settings, ShieldCheck, Sun, Moon, HelpCircle, ExternalLink, X, Heart, QrCode, Loader2, ChevronLeft, LogOut } from "lucide-react";
+import { Phone, Key, Lock, ArrowRight, Settings, ShieldCheck, Sun, Moon, HelpCircle, ExternalLink, X, QrCode, Loader2, ChevronLeft, LogOut } from "lucide-react";
 import { load } from '@tauri-apps/plugin-store';
 import { useTheme } from '../../context/ThemeContext';
 import { open } from '@tauri-apps/plugin-shell';
@@ -73,7 +73,6 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
     const [error, setError] = useState<string | null>(null);
     const [floodWait, setFloodWait] = useState<number | null>(null);
     const [showHelp, setShowHelp] = useState(false);
-    const [showDonate, setShowDonate] = useState(false);
     const [loginMethod, setLoginMethod] = useState<'phone' | 'qr'>('phone');
     const isMobile = typeof navigator !== 'undefined' && /android|iphone|ipad|ipod/i.test(navigator.userAgent.toLowerCase());
 
@@ -1042,15 +1041,6 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
                     </motion.div>
                 )}
 
-                <div className="mt-6 border-t border-app-border-subtle pt-3 text-center">
-                    <button
-                        onClick={() => setShowDonate(true)}
-                        className="quiet-control auth-secondary-action mx-auto px-2"
-                    >
-                        <Heart className="w-3.5 h-3.5 text-red-500/80" />
-                        Donate
-                    </button>
-                </div>
             </motion.div>
 
 
@@ -1134,54 +1124,6 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
                 )}
             </AnimatePresence>
 
-            <AnimatePresence>
-                {showDonate && (
-                    <motion.div
-                        initial={{ opacity: 0 }}
-                        animate={{ opacity: 1 }}
-                        exit={{ opacity: 0 }}
-                        className="fixed inset-0 z-50 flex items-center justify-center bg-app-overlay p-4 backdrop-blur-sm"
-                        onClick={() => setShowDonate(false)}
-                    >
-                        <motion.div
-                            initial={{ scale: 0.95, opacity: 0 }}
-                            animate={{ scale: 1, opacity: 1 }}
-                            exit={{ scale: 0.95, opacity: 0 }}
-                            className="quiet-raised w-full max-w-sm p-5"
-                            onClick={(e) => e.stopPropagation()}
-                        >
-                            <div className="relative mb-5 flex items-center justify-center">
-                                <h2 className="text-center text-app-title font-semibold text-app-text">
-                                    Support the Project
-                                </h2>
-                                <button onClick={() => setShowDonate(false)} className="quiet-control absolute end-0 flex h-8 w-8 items-center justify-center text-app-text-secondary hover:text-app-text" aria-label="Close donation options">
-                                    <X className="h-4 w-4" />
-                                </button>
-                            </div>
-
-                            <div className="space-y-4 text-center">
-                                <p className="mb-5 text-ui leading-relaxed text-app-text-secondary">
-                                    If you find Telegram Drive useful, consider supporting its development!
-                                </p>
-
-                                <div className="space-y-4">
-                                    <a href="#" onClick={(e) => { e.preventDefault(); open('https://www.paypal.me/Caamer20'); }} className="block hover:opacity-80 transition-opacity">
-                                        <img src="https://raw.githubusercontent.com/stefan-niedermann/paypal-donate-button/master/paypal-donate-button.png" alt="Donate with PayPal" width="200" className="mx-auto" />
-                                    </a>
-
-                                    <a href="#" onClick={(e) => { e.preventDefault(); open('https://link.trustwallet.com/send?address=ltc1q6wkr5ac4u0pxx4hx7xgwn0gsaku25ws0df73rp&asset=c2'); }} className="block hover:opacity-80 transition-opacity">
-                                        <img src="https://img.shields.io/badge/Donate-LTC-345D9D?style=for-the-badge&logo=litecoin&logoColor=white" alt="Donate LTC" className="mx-auto h-[28px]" />
-                                    </a>
-
-                                    <a href="#" onClick={(e) => { e.preventDefault(); open('https://link.trustwallet.com/send?asset=c0&address=bc1q5pt7m2fk6w0dzsnf6vvd5k6nw5k44785286ujy'); }} className="block hover:opacity-80 transition-opacity">
-                                        <img src="https://img.shields.io/badge/Donate-BTC-F7931A?style=for-the-badge&logo=bitcoin&logoColor=white" alt="Donate BTC" className="mx-auto h-[28px]" />
-                                    </a>
-                                </div>
-                            </div>
-                        </motion.div>
-                    </motion.div>
-                )}
-            </AnimatePresence>
 
         </div>
     );
